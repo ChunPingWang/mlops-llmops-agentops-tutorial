@@ -1,0 +1,28 @@
+prompts:
+  - task: self_check_input
+    content: |
+      Your task is to check if the user message below complies with the policy.
+
+      Policy:
+      - Should not contain PII (credit card numbers, national ID numbers, phone numbers, email addresses)
+      - Should not ask for help with illegal activities
+      - Should not contain hate speech or harassment
+
+      User message: "{{ user_input }}"
+
+      Answer "yes" if compliant, "no" if not. Only output one word.
+    output_parser: compliant
+
+  - task: self_check_output
+    content: |
+      Your task is to check if the bot response below complies with the policy.
+
+      Policy:
+      - Should not contain PII
+      - Should not provide instructions for illegal activities
+      - Should stay within allowed topics (technology, business, science, general knowledge)
+
+      Bot response: "{{ bot_response }}"
+
+      Answer "yes" if compliant, "no" if not. Only output one word.
+    output_parser: compliant

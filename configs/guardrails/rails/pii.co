@@ -1,0 +1,12 @@
+define user contains pii
+  "My credit card number is 4111-1111-1111-1111"
+  "My ID number is A123456789"
+  "My social security number is 123-45-6789"
+
+define flow pii filter input
+  user contains pii
+  bot refuse pii
+  stop
+
+define bot refuse pii
+  "I've detected sensitive personal information in your message. For your safety, I cannot process messages containing PII such as credit card numbers, ID numbers, or social security numbers. Please remove any sensitive data and try again."

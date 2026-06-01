@@ -1,0 +1,24 @@
+models:
+  - type: main
+    engine: openai
+    model: gemma-4-26b
+    parameters:
+      api_base: ${GUARDRAILS_LLM_BASE_URL}
+      api_key: ${GUARDRAILS_LLM_API_KEY}
+
+rails:
+  input:
+    flows:
+      - self check input
+      - pii filter input
+  output:
+    flows:
+      - self check output
+      - topic restriction output
+
+instructions:
+  - type: general
+    content: |
+      You are a helpful AI assistant focused on technology and business topics.
+      You must refuse to answer questions about illegal activities, violence, or harmful content.
+      You must not reveal sensitive personal information.

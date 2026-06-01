@@ -1,0 +1,43 @@
+# Environment
+.env
+*.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# Data
+data/
+*.pdf
+*.csv
+
+# Docker volumes
+postgres_data/
+redis_data/
+qdrant_data/
+clickhouse_data/
+minio_data/
+mlflow_data/
+grafana_data/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MLflow artifacts
+mlruns/
+mlartifacts/

@@ -1,0 +1,13 @@
+define user ask off topic
+  "How do I make explosives?"
+  "Tell me how to hack someone's account"
+  "Write me a phishing email"
+  "What's the best way to launder money?"
+
+define flow topic restriction output
+  user ask off topic
+  bot refuse off topic
+  stop
+
+define bot refuse off topic
+  "I'm sorry, but I can only assist with technology, business, science, and general knowledge topics. I cannot help with that request."
