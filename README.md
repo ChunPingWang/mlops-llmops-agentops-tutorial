@@ -789,6 +789,13 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 >
 > **`--with mlx-embeddings` / `pipx inject` 的關鍵**：embedding 套件要跟 mlx-omni-server **同一個** venv，A.2 的 `/v1/embeddings` router 才會自動掛載。
 >
+> **如果之前用錯 Python 版本（如 3.14）已經部分安裝過**：`uv tool install ...` 看到「already installed」會直接跳過，**不會**換 Python 版本、**不會**補上 `--with` 套件。要強制重裝：
+> ```bash
+> uv tool install --force --python 3.12 mlx-omni-server --with mlx-embeddings
+> # 或先 uv tool uninstall mlx-omni-server 再 install
+> ```
+> 同理 pipx 用 `pipx uninstall mlx-omni-server` 再裝。
+>
 > #### 為什麼是 Python 3.12 而不是 3.14？
 >
 > Python 3.14 是 2025-10 才 release 的，含 native extension 的套件（Rust via pyo3、C via Cython、C++ via pybind11）每個都要重 build wheel 才能上 PyPI。ML 生態通常**落後 Python 主線 6–12 個月**。判斷準則：
