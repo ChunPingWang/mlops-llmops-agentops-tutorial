@@ -709,9 +709,10 @@ ml-llm-agent-ops-tutorial/
 |------|---------|
 | Docker + Docker Compose | v24+ |
 | Python | 3.11+ |
-| GPU | VRAM ≥ 16GB（跑 Gemma 4 26B 4-bit） |
-| RAM | 64GB |
-| Disk | 50GB+ SSD |
+| 本地推論主機 | Apple Silicon Mac（OMLX）**或** Linux + GPU（vLLM/Ollama） |
+| LLM 記憶體 | 16 GB VRAM 或 16 GB 統一記憶體（跑 Gemma 4 26B 4-bit） |
+| RAM | 64 GB（含 14 個 Docker 服務） |
+| Disk | 50 GB+ SSD |
 
 ### 步驟
 
@@ -724,11 +725,9 @@ cd mlops-llmops-agentops-tutorial
 cp .env.example .env
 # 編輯 .env，填入你的 API Key（Azure、Anthropic）
 
-# 3. 啟動本地推論服務（需要 GPU）
-# 使用 vLLM:
-vllm serve gemma-4-26b-a4b-it-4bit --port 8000
-# 確認可用:
-curl http://127.0.0.1:8000/v1/models
+# 3. 啟動本地推論服務（chat + embedding）
+#    → 見下方「本地推論伺服器（OMLX / vLLM）」章節
+#    Mac 用 OMLX；Linux+GPU 用 vLLM。chat 和 embedding 都要備齊。
 
 # 4. 啟動全棧服務
 docker compose up -d
@@ -759,6 +758,144 @@ python scripts/test_integration.py
 | Dagster | http://localhost:3070 | 管線排程 |
 | Grafana | http://localhost:3001 | 監控 Dashboard |
 | Qdrant | http://localhost:6333/dashboard | 向量 DB 管理 |
+
+---
+
+## 本地推論伺服器（OMLX / vLLM）
+
+LiteLLM 本身不做推論——它只是把請求轉發給「真正的模型伺服器」。Docker stack 啟動前，這個 chat + embedding 端點必須先準備好。本專案在 macOS 上以 [OMLX (mlx-omni-server)](https://github.com/madroidmaq/mlx-omni-server) 為主，在 Linux + GPU 上以 vLLM 為主，兩者都提供 OpenAI-compatible API。
+
+### A. macOS（Apple Silicon）— OMLX 路線
+
+OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible API。一個 process 同時提供 `/v1/chat/completions` 與 `/v1/embeddings`。
+
+#### A.1 安裝 + 啟動 chat
+
+```bash
+pip install -U mlx-omni-server
+
+# 預先 pull 一個 chat 模型（不下也行，首次請求會自動下載）
+huggingface-cli download mlx-community/gemma-4-26b-a4b-it-4bit
+
+# 啟動 server（綁 0.0.0.0 才能讓其他機器存取）
+mlx-omni-server --host 0.0.0.0 --port 8000
+
+# 測試
+curl http://127.0.0.1:8000/v1/models | jq '.data[].id'
+```
+
+OMLX 預設不要求 API key；要啟用 bearer 鑑權的話傳 `--api-keys VMware1!` 即可。**本專案的 `.env` 預設 `OMLX_API_KEY=VMware1!`，記得對齊。**
+
+#### A.2 加入 embedding 模型（V-09/V-11/V-19 必須）
+
+mlx-omni-server **支援** `/v1/embeddings`，但 router 只在 `mlx-embeddings` 套件可 import 時才會自動掛載。如果你直接 `curl /v1/embeddings` 拿到 404，就是這個原因：
+
+```bash
+# 1. 升級 server 並補上 embeddings 套件
+pip install -U mlx-omni-server mlx-embeddings
+
+# 2. 預先 pull 一個 embedding 模型
+huggingface-cli download mlx-community/mxbai-embed-large-v1
+
+# 3. 重啟 server（不必加 --model 等 flag；router 看到套件就自動掛載）
+pkill -f mlx-omni-server 2>/dev/null
+MLX_OMNI_LOG_LEVEL=debug mlx-omni-server --host 0.0.0.0 --port 8000
+
+# 4. 驗證 embedding 端點（從另一台機器跑也行）
+curl -sS http://10.0.0.3:8000/v1/embeddings \
+  -H "Authorization: Bearer VMware1!" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mlx-community/mxbai-embed-large-v1","input":"hello"}' \
+  | jq '.data[0].embedding | length'
+# 預期印出: 1024
+```
+
+既有的 chat 模型不會被卸載——OMLX 對每個 model 各自 in-process cache。
+
+#### A.3 embedding 模型建議三選一
+
+| HF 模型 ID | 維度 | 大小 | 適合 |
+|---|---|---|---|
+| `mlx-community/mxbai-embed-large-v1` | **1024** | ~670 MB | RAG 預設選擇，品質 / 速度平衡 |
+| `mlx-community/all-MiniLM-L6-v2-4bit` | **384** | ~13 MB | 最快、最小 |
+| `mlx-community/bge-m3-mlx-fp16` | **1024** | ~2.2 GB | 多語言、長 context（8 192 tokens） |
+
+選完之後在 `.env` 設 `EMBEDDING_MODEL=<id>`，並把 `scripts/seed_qdrant.py` 的 `VECTOR_SIZE` 對齊到該模型維度（**1024** 或 **384**）。
+
+#### A.4 退路：embeddings 仍 404 時，跑獨立 server
+
+如果升級完還是 404（代表這個 build 的 router 真沒掛起來），用 `mlx-embeddings` 本身的 server 跑在另一個 port：
+
+```bash
+pip install -U mlx-embeddings
+python -m mlx_embeddings.server --host 0.0.0.0 --port 8001 \
+  --model mlx-community/mxbai-embed-large-v1
+```
+
+然後在 `configs/litellm/config.yaml` 把 `text-embedding` 模型的 `api_base` 改指 `http://10.0.0.3:8001/v1`，chat 維持 `:8000`。
+
+### B. Linux + GPU — vLLM 路線
+
+```bash
+pip install vllm sentence-transformers
+# Chat
+vllm serve mlx-community/gemma-4-26b-a4b-it-4bit --port 8000 &
+# Embedding（另一個 process / 另一個 port 比較乾淨）
+vllm serve BAAI/bge-large-en-v1.5 --port 8001 --task embed &
+```
+
+兩個 port 都 OpenAI-compatible；`.env` 設兩個 BASE_URL 即可：
+```bash
+LOCAL_LLM_BASE_URL=http://127.0.0.1:8000/v1     # chat
+EMBEDDING_BASE_URL=http://127.0.0.1:8001/v1     # embeddings
+```
+
+### C. 對齊 `.env` 與 LiteLLM config
+
+無論 A 或 B，本專案都靠這些變數把外部 endpoint 灌進 LiteLLM 容器：
+
+```bash
+# .env
+LOCAL_LLM_BASE_URL=http://10.0.0.3:8000/v1        # OMLX / vLLM chat
+LOCAL_LLM_MODEL=gemma-4-26b-a4b-it-4bit
+OMLX_API_KEY=VMware1!                              # 若 server 啟 bearer
+EMBEDDING_MODEL=mlx-community/mxbai-embed-large-v1 # 選好的 embedding id
+```
+
+`configs/litellm/config.yaml` 已經把 chat（`gemma-4-26b`）和 embedding（`text-embedding`）兩個邏輯模型都接到同一個 `LOCAL_LLM_BASE_URL`；如果你走 B 把 embedding 拆到另一個 port，把那一段的 `api_base` 改成獨立環境變數即可。
+
+> **記得：** 改完 `.env` 後 `docker compose up -d --no-deps --force-recreate litellm`，讓 proxy 重新讀。
+
+### D. 為什麼這個驗證流程需要上面這些設定？
+
+每個設定都對應一個會壞掉的環節。讀者照抄指令前，知道下面這條因果鏈會少踩很多坑：
+
+| 設定 | 不做會發生什麼 | 為什麼 |
+|------|---------------|--------|
+| **`pip install mlx-embeddings`** | `/v1/embeddings` 回 **404**，所有 RAG/Mem0 驗證（V-09/V-11/V-19）整段斷線 | mlx-omni-server 採「optional dependency」設計，embeddings router 只在啟動時能 `import mlx_embeddings` 才會掛載；缺套件就靜默跳過，FastAPI 路由表裡根本沒有這個 URL |
+| **預先 `huggingface-cli download`** | 第一次請求要等下載（幾百 MB 到幾 GB），測試 timeout 失敗，誤判成「服務壞掉」 | mlx-omni-server 是 lazy-load，模型不在 `~/.cache/huggingface` 就會即時下載；預 pull 把這個延遲移到「設定時」而非「測試時」 |
+| **server 綁 `--host 0.0.0.0`** | 從別台機器（如跑 Docker stack 的 Linux 主機）連會 `connection refused` | 預設只綁 `127.0.0.1`，外部請求 ARP 得到主機後 TCP 連不到 service。Mac 跟 Docker 主機是同一台時這條可以省略，跨機器則必開 |
+| **bearer token（`OMLX_API_KEY`）對齊** | LiteLLM 拿到上游 **401**，所有 chat 與 embedding 都失敗 | OMLX 啟用 `--api-keys` 後會驗 `Authorization: Bearer <key>`；LiteLLM 用 `configs/litellm/config.yaml` 的 `api_key: "os.environ/OMLX_API_KEY"` 從容器環境讀值；`.env` 沒設或字串不一致就一路 401 |
+| **`EMBEDDING_MODEL` 設成完整 HF id** | LiteLLM 路由失敗：`Bad model id` 或 OMLX 端 404 | LiteLLM `model_list` 裡 `text-embedding` 的 `model:` 欄位（去前綴 `openai/`）會原封不動轉發給上游；OMLX 接 OpenAI API 規範，model 欄位必須是它認識的 HF id（短名 `text-embedding-3-small` 不會自動 resolve） |
+| **`VECTOR_SIZE` 對齊模型維度** | `scripts/seed_qdrant.py` upsert 時 Qdrant 回 **400 dimension mismatch** | Qdrant collection 建立時就**固定**向量維度；之後 upsert 的每個 vector 長度必須完全相符。`mxbai-embed-large-v1` 是 1024、`MiniLM-L6` 是 384，跑錯 collection 整個 RAG 就索引不進去 |
+| **改 `.env` 後重啟 LiteLLM** | LiteLLM 還拿著舊的 base_url / api_key，新請求一律打到舊位置 | LiteLLM proxy 啟動時把 `os.environ/...` 解析成具體字串放進 process memory；之後改 `.env` 並不會 hot-reload。`docker compose up -d --no-deps --force-recreate litellm` 重啟容器 = 重讀 env |
+| **chat 與 embedding 共用同一個 port（A 方案）** | 兩個 server 一個 process，記憶體有可能擠爆統一記憶體（Apple Silicon） | 同一個 OMLX 同時 cache 26B chat 模型（~16 GB）+ embedding 模型（~700 MB），24 GB 統一記憶體勉強夠；32 GB 以上才舒服。若 RAM 緊張，用 A.4 退路把 embedding 拆到 `:8001` 並用較小模型 |
+| **重建 Qdrant collection（`recreate_collection=True`）** | 舊維度 / 舊資料殘留，新 upsert 跟舊向量混在一起無法檢索 | 換 embedding 模型 = 換維度 = 必須丟掉舊 collection。`seed_qdrant.py` 預設就 force-recreate，但 production 場景要小心：這會 **truncate** 原本所有資料 |
+
+#### 「為什麼 V-09/V-11/V-19 一定要 embedding？」
+
+| V-item | 流程 | 為何要 embedding |
+|--------|------|----------------|
+| **V-09 RAGAS** | 拿 (question, contexts, answer, ground_truth) 算 faithfulness / answer_relevancy / context_precision / context_recall | RAGAS 的 `answer_relevancy` 是用 embedding 做的 cosine similarity；沒 embedding 模型 → metric 算不出來 |
+| **V-11 RAG end-to-end** | 文件切片 → 向量化 → 存 Qdrant → 查詢時向量化 question → 取 top-k → 餵 LLM | 整條 pipeline 的入口和出口都靠 embedding；沒 embedding = 沒 RAG |
+| **V-19 Mem0** | 對話訊息 → 抽出 fact → 向量化 → 存 Qdrant；下次查詢時用語意搜尋找回 | Mem0 用 embedding 來判斷「兩條對話講的是不是同一件事」；沒 embedding 退化為純 keyword 搜尋（效果很差） |
+
+#### 為什麼這幾項堅持用 **本地** embedding（而非 OpenAI/Cohere）？
+
+- **資料主權**：RAG 文件、Mem0 個人對話往往含敏感資訊，送雲端 = 違規。
+- **成本**：embedding 是「批次大、頻率高」的操作（文件切完每片都要算一次），每月可能上百萬次呼叫；本地一次性 RAM 換錢。
+- **延遲**：本地 sub-100ms，雲端 200–500ms（含網路）；RAG 是 critical path，多 300ms 直接影響使用者體驗。
+- **PoC 的初衷**：證明全棧可在本地閉環，cloud LLM 只當 fallback。Embedding 上雲就破壞了這個前提。
 
 ---
 
