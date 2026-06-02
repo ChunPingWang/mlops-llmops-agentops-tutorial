@@ -771,8 +771,23 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 
 #### A.1 安裝 + 啟動 chat
 
+> **macOS Python 3.12+（PEP 668）注意**：直接 `pip install` 會拿到
+> `error: externally-managed-environment`。下面三選一即可：
+>
+> | 方式 | 指令 | 適合 |
+> |------|------|------|
+> | **`uv`（推薦）** | `brew install uv && uv tool install mlx-omni-server --with mlx-embeddings` | 想要 isolated env 又有系統級 CLI |
+> | **`pipx`** | `brew install pipx && pipx install mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings` | 跟 uv 等價的老牌方案 |
+> | **venv** | `python3 -m venv ~/.venvs/omlx && source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings` | 不想多裝工具，但每次開 shell 要 `source` |
+>
+> **不要用** `pip install --break-system-packages`：違反 PEP 668 設計、brew 升級 Python 時會壞掉。
+>
+> **`uv tool install` 的關鍵**：`--with mlx-embeddings` 把 embedding 套件裝進**同一個** venv，這樣 `mlx-omni-server` import 才到（A.2 那條 router 才會掛起來）。pipx 用 `inject` 也是同樣道理。
+
 ```bash
-pip install -U mlx-omni-server
+# 用 uv 一次裝齊（chat 與 embedding 共用同一個 isolated env）
+brew install uv
+uv tool install mlx-omni-server --with mlx-embeddings
 
 # 預先 pull 一個 chat 模型（不下也行，首次請求會自動下載）
 huggingface-cli download mlx-community/gemma-4-26b-a4b-it-4bit
@@ -792,7 +807,10 @@ mlx-omni-server **支援** `/v1/embeddings`，但 router 只在 `mlx-embeddings`
 
 ```bash
 # 1. 升級 server 並補上 embeddings 套件
-pip install -U mlx-omni-server mlx-embeddings
+#    （如果 A.1 已用 uv tool install ... --with mlx-embeddings，這步可跳過）
+uv tool install --upgrade mlx-omni-server --with mlx-embeddings
+# pipx 版本: pipx upgrade mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings --force
+# venv 版本: source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings
 
 # 2. 預先 pull 一個 embedding 模型
 huggingface-cli download mlx-community/mxbai-embed-large-v1
