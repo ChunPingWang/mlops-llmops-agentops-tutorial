@@ -7,7 +7,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+ && pip install --no-cache-dir \
+    "langchain-text-splitters>=0.3.0" \
+    "langchain-google-vertexai>=2.0.0"
+# langchain-text-splitters: split from langchain in 0.3 (rag_pipeline import path)
+# langchain-google-vertexai: ragas imports vertexai chat-models even when unused
 
 WORKDIR /app
 CMD ["python", "--version"]

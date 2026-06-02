@@ -25,11 +25,14 @@ load_dotenv()
 
 from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_community.document_loaders import PyPDFLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# langchain >=0.3 split text splitters out to a standalone package
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_qdrant import QdrantVectorStore
-from langchain.chains import RetrievalQA
-from langchain.prompts import PromptTemplate
+# RetrievalQA was removed from langchain ≥0.4; rebuild with LCEL primitives.
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
 
@@ -210,8 +213,13 @@ def build_retrieval_chain(
     vectorstore: QdrantVectorStore,
     llm: ChatOpenAI | None = None,
     search_k: int = 4,
-) -> RetrievalQA:
-    """Build a RetrievalQA chain backed by Qdrant."""
+):
+    """Build a retrieval chain using LCEL (replaces deprecated RetrievalQA).
+
+    Returns an object exposing .invoke({"query": ...}) that produces a dict
+    with `result` and `source_documents`, matching the old RetrievalQA API
+    enough for the demo below.
+    """
     llm = llm or get_llm()
 
     prompt = PromptTemplate(
@@ -221,17 +229,33 @@ def build_retrieval_chain(
 
     retriever = vectorstore.as_retriever(search_kwargs={"k": search_k})
 
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt},
+    def _format_docs(docs):
+        return "\n\n".join(d.page_content for d in docs)
+
+    # LCEL pipeline: retrieve → format → prompt → llm → parse string
+    answer_chain = (
+        {
+            "context": (lambda x: x["query"]) | retriever | _format_docs,
+            "question": (lambda x: x["query"]),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
     )
-    return chain
+
+    class _ChainWrapper:
+        """Thin wrapper to keep the .invoke({"query": ...}) → {"result", "source_documents"} shape."""
+
+        def invoke(self, payload, config=None):
+            question = payload["query"]
+            docs = retriever.invoke(question, config=config)
+            answer = answer_chain.invoke({"query": question}, config=config)
+            return {"result": answer, "source_documents": docs, "query": question}
+
+    return _ChainWrapper()
 
 
-def ask(chain: RetrievalQA, question: str, langfuse_handler=None) -> dict:
+def ask(chain, question: str, langfuse_handler=None) -> dict:
     """Run a question through the retrieval chain with optional Langfuse tracing."""
     callbacks = [langfuse_handler] if langfuse_handler else []
     result = chain.invoke({"query": question}, config={"callbacks": callbacks})

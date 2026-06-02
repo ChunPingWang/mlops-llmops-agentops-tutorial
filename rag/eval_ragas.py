@@ -17,10 +17,28 @@ Environment variables (loaded from .env):
 """
 
 import os
+import sys
+import types
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Compatibility shim: ragas 0.4.x hard-imports
+# `langchain_community.chat_models.vertexai.ChatVertexAI`, but
+# langchain-community 0.4+ moved Vertex out to `langchain-google-vertexai`.
+# Inject a stub so the eager import in ragas/llms/base.py succeeds.
+# ---------------------------------------------------------------------------
+if "langchain_community.chat_models.vertexai" not in sys.modules:
+    try:
+        from langchain_google_vertexai import ChatVertexAI as _ChatVertexAI
+    except ImportError:
+        class _ChatVertexAI:  # placeholder; ragas never uses it unless you
+            pass               # pass a Vertex llm explicitly
+    _stub = types.ModuleType("langchain_community.chat_models.vertexai")
+    _stub.ChatVertexAI = _ChatVertexAI
+    sys.modules["langchain_community.chat_models.vertexai"] = _stub
 
 import pandas as pd
 from ragas import EvaluationDataset, evaluate

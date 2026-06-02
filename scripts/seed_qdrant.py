@@ -31,8 +31,13 @@ from qdrant_client.models import (
 # ---------------------------------------------------------------------------
 
 COLLECTION_NAME = "rag_documents"
-VECTOR_SIZE = 768  # Gemma embedding dimensionality
-EMBEDDING_MODEL = "text-embedding"
+# Vector size MUST match the embedding model's output dimensionality
+# (mxbai-embed-large-v1 = 1024; all-MiniLM-L6-v2 = 384; OpenAI text-embedding-3-large = 3072).
+# Override via VECTOR_SIZE env var to match your chosen embedding model.
+VECTOR_SIZE = int(os.getenv("VECTOR_SIZE", "1024"))
+# Embedding model id. With OMLX/mlx-omni-server pass the full HF repo path;
+# with LiteLLM proxy you can use the short alias declared in config.yaml.
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "mlx-community/mxbai-embed-large-v1")
 
 
 def _get_env(name: str, default: str | None = None) -> str:
@@ -179,17 +184,20 @@ def test_query(client: QdrantClient) -> None:
 
     query_embedding = get_embeddings([query_text])[0]
 
-    results = client.search(
+    # qdrant-client removed client.search() in favour of query_points()
+    response = client.query_points(
         collection_name=COLLECTION_NAME,
-        query_vector=query_embedding,
+        query=query_embedding,
         limit=3,
+        with_payload=True,
     )
+    results = getattr(response, "points", response)
 
     print(f"[test] Top {len(results)} results:")
     for i, hit in enumerate(results, 1):
         score = hit.score
-        text_preview = hit.payload.get("text", "")[:100]
-        source = hit.payload.get("source", "unknown")
+        text_preview = (hit.payload or {}).get("text", "")[:100]
+        source = (hit.payload or {}).get("source", "unknown")
         print(f"  {i}. [score={score:.4f}] ({source}) {text_preview}...")
 
 
@@ -227,7 +235,9 @@ def main():
     info = client.get_collection(COLLECTION_NAME)
     print(f"\n[info] Collection '{COLLECTION_NAME}' status: {info.status}")
     print(f"[info] Points count: {info.points_count}")
-    print(f"[info] Vectors count: {info.vectors_count}")
+    # Newer qdrant-client renames vectors_count → indexed_vectors_count.
+    indexed = getattr(info, "indexed_vectors_count", None) or getattr(info, "vectors_count", "n/a")
+    print(f"[info] Indexed vectors: {indexed}")
 
     print("\nDone.")
 

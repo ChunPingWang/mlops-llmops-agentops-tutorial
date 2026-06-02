@@ -6,9 +6,10 @@ model_list:
       api_key: "os.environ/OMLX_API_KEY"
 
   # Embedding endpoint served by the same OMLX server.
+  # model id MUST be the full HF repo path OMLX recognises (see `/v1/models`).
   - model_name: "text-embedding"
     litellm_params:
-      model: "openai/text-embedding"
+      model: "openai/mlx-community/mxbai-embed-large-v1"
       api_base: "os.environ/LOCAL_LLM_BASE_URL"
       api_key: "os.environ/OMLX_API_KEY"
 

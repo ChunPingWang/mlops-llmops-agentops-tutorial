@@ -36,6 +36,9 @@ config = {
             "host": os.getenv("QDRANT_HOST", "localhost"),
             "port": int(os.getenv("QDRANT_PORT", 6333)),
             "collection_name": "mem0_memories",
+            # Mem0 defaults this to 1536 (OpenAI text-embedding-ada-002).
+            # mxbai-embed-large-v1 is 1024; mismatch → 400 on first search.
+            "embedding_model_dims": int(os.getenv("EMBEDDING_DIMS", "1024")),
         },
     },
     "llm": {
