@@ -897,6 +897,95 @@ EMBEDDING_MODEL=mlx-community/mxbai-embed-large-v1 # 選好的 embedding id
 - **延遲**：本地 sub-100ms，雲端 200–500ms（含網路）；RAG 是 critical path，多 300ms 直接影響使用者體驗。
 - **PoC 的初衷**：證明全棧可在本地閉環，cloud LLM 只當 fallback。Embedding 上雲就破壞了這個前提。
 
+### E. 舉一反三：換到 OpenAI / Azure / Anthropic / Bedrock / Vertex / Ollama 時需不需要這些設定？
+
+上面 D 節列的每一條設定都對應「LLM 平台之間的某個合約差異」。換平台時不要照抄，而是問五個問題：
+
+#### 問題 1：**Auth 怎麼帶？**
+
+| 平台 | 機制 | 在 LiteLLM `litellm_params` 怎麼寫 | 對應 D 表 |
+|------|------|-----------------------------------|----------|
+| OpenAI | `Authorization: Bearer sk-...` | `api_key: "os.environ/OPENAI_API_KEY"` | bearer 對齊 |
+| Azure OpenAI | `api-key: <key>` header + `api-version` query | `api_key: ...` + `api_version: "2024-10-21"` | 多一條 api_version |
+| Anthropic | `x-api-key: sk-ant-...` header | `api_key: "os.environ/ANTHROPIC_API_KEY"` | bearer 對齊 |
+| AWS Bedrock | SigV4 簽章（從 IAM 角色 / `~/.aws/credentials`） | `aws_region_name: ...` + `aws_access_key_id` + `aws_secret_access_key` | 不是 bearer，是 IAM；憑證鏈不一樣 |
+| Google Vertex AI | OAuth2 access token（從 ADC / service account JSON） | `vertex_project: ...` + `vertex_location: ...` + `vertex_credentials: <json file>` | 同上，憑證來自 GCP ADC |
+| Ollama | 預設無 auth | `api_key: "ollama"`（佔位即可） | 通常省略 |
+| vLLM | 預設無 auth；可開 `--api-key` | `api_key: "..."` 或 `"no-key-needed"` | 與 OMLX 同 |
+| OMLX | 預設無 auth；可開 `--api-keys` | `api_key: "os.environ/OMLX_API_KEY"` | 本專案做法 |
+
+**判斷準則**：先 `curl <endpoint>/v1/models`。回 401 → 需要 auth，去查文件用什麼 header；回 200 → 沒開 auth，`api_key` 隨便填都通。
+
+#### 問題 2：**Embedding 跟 Chat 是同一個 endpoint 嗎？**
+
+| 平台 | Chat 端點 | Embedding 端點 | 要不要拆？ |
+|------|-----------|--------------|-----------|
+| OpenAI | `https://api.openai.com/v1/chat/completions` | `https://api.openai.com/v1/embeddings`（同 base url） | 否，同 endpoint |
+| Azure OpenAI | `.../openai/deployments/<chat-dep>/chat/completions` | `.../openai/deployments/<embed-dep>/embeddings`（**每個 deployment 一個 URL**） | **是**，model_list 要寫兩條，api_base 都不一樣 |
+| Anthropic | `https://api.anthropic.com/v1/messages` | **無 embedding API**——需另接 Voyage / Cohere | **是**，跨 provider |
+| AWS Bedrock | `bedrock-runtime` invokeModel | 同 `bedrock-runtime`，不同 modelId（如 `cohere.embed-english-v3`） | 否，同 endpoint，model id 切換 |
+| Vertex AI | `aiplatform.googleapis.com` predict | 同上，不同 publisher model | 否 |
+| Ollama | `:11434/api/chat`（**非 OpenAI 規範**） | `:11434/api/embeddings` | 同 endpoint 但路徑不同；LiteLLM 包好了 |
+| vLLM | `:PORT/v1/chat/completions` | **同 server 不能同時 chat + embed**；要起兩個 process | **是**，兩個 port，model_list 兩條 |
+| OMLX | `:8000/v1/chat/completions` | `:8000/v1/embeddings`（同 process） | 否，但 router 要靠 `mlx-embeddings` import 才掛載 |
+
+**判斷準則**：問三件事——
+1. 同一個 base URL 嗎？（決定 `api_base` 寫幾條）
+2. 同一支 model 嗎？（決定 `model:` 怎麼路由）
+3. 同一個 process 載入兩種模型 RAM 夠嗎？（決定 OMLX 走 A 還 A.4）
+
+#### 問題 3：**Model id 寫什麼？短名還是完整路徑？**
+
+| 平台 | 範例 model id | 規則 |
+|------|--------------|------|
+| OpenAI | `gpt-4o`, `text-embedding-3-large` | 官方短名 |
+| Azure OpenAI | `gpt-4o`（你的 **deployment name**，不是 model name） | 跟你在 Azure portal 部署時取的名一致 |
+| Anthropic | `claude-sonnet-4-20250514` | 含日期版本 |
+| Bedrock | `anthropic.claude-3-5-sonnet-20240620-v1:0` | `<vendor>.<model>-<ver>:<modifier>` |
+| Vertex | `gemini-1.5-pro-002` | Vertex publisher model 名 |
+| Ollama | `llama3.2:3b`, `nomic-embed-text` | `<name>:<tag>` |
+| vLLM | 啟動時 `--model` 指定的 HF id（如 `BAAI/bge-large-en-v1.5`） | 完整 HF repo path |
+| OMLX | `mlx-community/mxbai-embed-large-v1` | 完整 HF repo path |
+
+**判斷準則**：`curl <endpoint>/v1/models` 看回傳的 `data[].id`——那個字串就是你該填的。不要用「OpenAI 的短名」去打 Bedrock，也不要用「HF id」去打 Azure deployment。
+
+#### 問題 4：**模型怎麼載入？on-demand、preload、還是不能改？**
+
+| 平台 | 模型載入方式 | 換模型要不要重啟？ |
+|------|-------------|-------------------|
+| 雲端 API（OpenAI/Azure/Anthropic/Bedrock/Vertex） | 由 provider 管，呼叫即用 | 永遠不用重啟；改 model id 就生效 |
+| Ollama | `ollama pull <model>` → 第一次推論時載入到 GPU | **不用重啟**；Ollama 自己 swap model |
+| vLLM | 啟動參數 `--model` 固定；換模型 = 重啟 process | **要重啟**；且一次只能服務一個 chat 模型 |
+| OMLX | Lazy load + in-process cache，請求帶哪個 model id 就現載哪個 | **不用重啟**；但首次請求要等下載 |
+| Local sentence-transformers | Python in-process load on import | **要重啟 Python**；不過 embedding 通常啟動就決定 |
+
+**判斷準則**：preload 型（vLLM）= 換模型要 redeploy；lazy 型（OMLX/Ollama）= 在 LiteLLM `model_list` 加一條就能多用一個模型。**雲端**則完全不用管 loading，只看 quota。
+
+#### 問題 5：**改設定要不要重啟 LiteLLM？**
+
+不分平台，**永遠要**。LiteLLM proxy 啟動時把 `os.environ/...` 解析成具體字串放進 process memory，不 hot-reload。改 `.env` / `config.yaml` 後都要 `docker compose up -d --no-deps --force-recreate litellm`。
+
+對應**上游平台**本身要不要重啟，看問題 4。
+
+#### 因此 D 表上每條設定在不同平台的對應：
+
+| D 表設定 | 雲端（OpenAI/Azure/Anthropic/Bedrock/Vertex） | Ollama | vLLM | OMLX |
+|----------|---------------------------------------------|--------|------|------|
+| 裝 embedding 套件 | ❌（cloud 自帶） | ❌（embedding 模型 = pull） | ✅（要另起 vLLM process） | ✅（`mlx-embeddings`） |
+| 預先 download 模型 | ❌ | ✅（`ollama pull`） | ✅（HF cache） | ✅（HF cache） |
+| Server 綁 `0.0.0.0` | ❌（公有 endpoint） | ✅（預設 `127.0.0.1`） | ✅ | ✅ |
+| Bearer token 對齊 | ✅（各家 auth header 不同） | ❌ | 可選 | 可選 |
+| `model:` 用完整 ID | 看平台慣例（短名 / deployment / HF id） | tag 格式 | HF id | HF id |
+| `VECTOR_SIZE` 對齊維度 | ✅（OpenAI text-embedding-3-large 是 3072；可用 `dimensions:` 參數截短） | ✅（nomic-embed-text 768） | ✅ | ✅ |
+| 重啟 LiteLLM | ✅ | ✅ | ✅ | ✅ |
+| 重建 Qdrant collection | ✅（換 embedding 模型必做，跟平台無關） | ✅ | ✅ | ✅ |
+
+#### 一句話總結
+
+**「上游平台 + 模型 + auth」三件事任一改變，都要走一次：對齊 `.env` → 對齊 LiteLLM `model_list` → 重建 vector store（若換 embedding） → 重啟 LiteLLM。**
+
+LiteLLM 的價值就是把這些細節都包進 `litellm_params`，讓**應用程式**對上游一無所知；但**運維**這一層永遠要知道上游的合約。
+
 ---
 
 ## 介面截圖
