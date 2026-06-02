@@ -771,23 +771,40 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 
 #### A.1 安裝 + 啟動 chat
 
-> **macOS Python 3.12+（PEP 668）注意**：直接 `pip install` 會拿到
-> `error: externally-managed-environment`。下面三選一即可：
+> **macOS 安裝兩個坑要避開**：
+>
+> 1. **PEP 668**：直接 `pip install` 拿到 `error: externally-managed-environment`——系統 / Homebrew Python 預設不准動。
+> 2. **Python 版本**：必須是 **3.12** 或 3.13。Python 3.14（2025-10 release）目前還沒 wheel：mlx-omni-server 的 transitive deps（outlines-core / pyo3）只支援到 3.13，硬裝會在 Rust build 階段炸：
+>    > `error: the configured Python interpreter version (3.14) is newer than PyO3's maximum supported version (3.13)`
+>
+> 推薦用 **uv**，因為它能自動下載並隔離 Python 3.12，不必碰系統 Python：
 >
 > | 方式 | 指令 | 適合 |
 > |------|------|------|
-> | **`uv`（推薦）** | `brew install uv && uv tool install mlx-omni-server --with mlx-embeddings` | 想要 isolated env 又有系統級 CLI |
-> | **`pipx`** | `brew install pipx && pipx install mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings` | 跟 uv 等價的老牌方案 |
-> | **venv** | `python3 -m venv ~/.venvs/omlx && source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings` | 不想多裝工具，但每次開 shell 要 `source` |
+> | **`uv`（推薦）** | `brew install uv && uv tool install --python 3.12 mlx-omni-server --with mlx-embeddings` | 一行解決 PEP 668 + Python 版本兩坑 |
+> | **`pipx`** | `brew install python@3.12 pipx && pipx ensurepath && pipx install --python /opt/homebrew/bin/python3.12 mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings` | 必須先 brew 裝 3.12 |
+> | **venv** | `/opt/homebrew/bin/python3.12 -m venv ~/.venvs/omlx && source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings` | 每次開 shell 要 `source` |
 >
-> **不要用** `pip install --break-system-packages`：違反 PEP 668 設計、brew 升級 Python 時會壞掉。
+> **不要用** `pip install --break-system-packages`、**也不要用 `python3` 預設版本不檢查**：違反 PEP 668 或踩 Python 3.14 缺 wheel 的雷。
 >
-> **`uv tool install` 的關鍵**：`--with mlx-embeddings` 把 embedding 套件裝進**同一個** venv，這樣 `mlx-omni-server` import 才到（A.2 那條 router 才會掛起來）。pipx 用 `inject` 也是同樣道理。
+> **`--with mlx-embeddings` / `pipx inject` 的關鍵**：embedding 套件要跟 mlx-omni-server **同一個** venv，A.2 的 `/v1/embeddings` router 才會自動掛載。
+>
+> #### 為什麼是 Python 3.12 而不是 3.14？
+>
+> Python 3.14 是 2025-10 才 release 的，含 native extension 的套件（Rust via pyo3、C via Cython、C++ via pybind11）每個都要重 build wheel 才能上 PyPI。ML 生態通常**落後 Python 主線 6–12 個月**。判斷準則：
+>
+> | Python 版本 | ML 生態狀態 | 適合 |
+> |------------|------------|------|
+> | **3.12** | 完全成熟 | 生產 / PoC 預設 |
+> | **3.13** | 多數套件已補 | 較新環境 |
+> | **3.14** | 大坑期 | 約 2026 Q2/Q3 後再考慮 |
+> | ≤3.10 | EOL 或接近 EOL | 不要 |
 
 ```bash
 # 用 uv 一次裝齊（chat 與 embedding 共用同一個 isolated env）
+# --python 3.12 避免踩到 Python 3.14 的 wheel 缺漏
 brew install uv
-uv tool install mlx-omni-server --with mlx-embeddings
+uv tool install --python 3.12 mlx-omni-server --with mlx-embeddings
 
 # 預先 pull 一個 chat 模型（不下也行，首次請求會自動下載）
 huggingface-cli download mlx-community/gemma-4-26b-a4b-it-4bit
@@ -807,8 +824,8 @@ mlx-omni-server **支援** `/v1/embeddings`，但 router 只在 `mlx-embeddings`
 
 ```bash
 # 1. 升級 server 並補上 embeddings 套件
-#    （如果 A.1 已用 uv tool install ... --with mlx-embeddings，這步可跳過）
-uv tool install --upgrade mlx-omni-server --with mlx-embeddings
+#    （如果 A.1 已用 uv tool install --python 3.12 ... --with mlx-embeddings，這步可跳過）
+uv tool install --python 3.12 --upgrade mlx-omni-server --with mlx-embeddings
 # pipx 版本: pipx upgrade mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings --force
 # venv 版本: source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings
 
