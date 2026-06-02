@@ -86,7 +86,8 @@ def train_and_log() -> str:
         mlflow.set_tags({"model_type": "RandomForestClassifier", "dataset": "iris"})
 
         # --- log model artifact ---
-        mlflow.sklearn.log_model(clf, artifact_path="model")
+        # MLflow 2.x deprecated artifact_path= in favor of name=
+        mlflow.sklearn.log_model(clf, name="model")
         model_uri = f"runs:/{run_id}/model"
         logger.info("Model URI: %s", model_uri)
 
@@ -94,7 +95,12 @@ def train_and_log() -> str:
 
 
 def register_and_promote(run_id: str) -> None:
-    """Register the model from *run_id* and transition it to Production."""
+    """Register the model from *run_id* and promote it via aliases.
+
+    MLflow stages (None/Staging/Production/Archived) were deprecated in
+    MLflow 2.9 and are removed in 3.x. Aliases (mutable named pointers to
+    versions) are the replacement.
+    """
 
     client = MlflowClient(tracking_uri=TRACKING_URI)
     model_uri = f"runs:/{run_id}/model"
@@ -109,29 +115,29 @@ def register_and_promote(run_id: str) -> None:
         mv.source,
     )
 
-    # Transition: None -> Staging
-    client.transition_model_version_stage(
+    # Promote: tag as staging, then production
+    client.set_registered_model_alias(
         name=REGISTERED_MODEL_NAME,
+        alias="staging",
         version=version,
-        stage="Staging",
     )
-    logger.info("Transitioned v%s to Staging", version)
+    logger.info("Aliased v%s as 'staging'", version)
 
-    # Transition: Staging -> Production
-    client.transition_model_version_stage(
+    client.set_registered_model_alias(
         name=REGISTERED_MODEL_NAME,
+        alias="production",
         version=version,
-        stage="Production",
     )
-    logger.info("Transitioned v%s to Production", version)
+    logger.info("Aliased v%s as 'production'", version)
 
     # Print summary
     latest = client.get_model_version(REGISTERED_MODEL_NAME, version)
+    aliases = getattr(latest, "aliases", []) or []
     logger.info(
-        "Registry info  name=%s  version=%s  stage=%s  status=%s",
+        "Registry info  name=%s  version=%s  aliases=%s  status=%s",
         latest.name,
         latest.version,
-        latest.current_stage,
+        list(aliases),
         latest.status,
     )
 

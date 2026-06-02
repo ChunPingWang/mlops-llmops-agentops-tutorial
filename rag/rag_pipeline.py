@@ -27,10 +27,10 @@ from langchain_community.document_loaders import DirectoryLoader, TextLoader
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Qdrant
+from langchain_qdrant import QdrantVectorStore
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
-from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +46,12 @@ def _get_env(name: str, default: str | None = None) -> str:
 
 
 def get_langfuse_handler() -> LangfuseCallbackHandler | None:
-    """Create a Langfuse callback handler if credentials are available."""
+    """Create a Langfuse v3 callback handler if credentials are available.
+
+    v3's CallbackHandler reads credentials from env vars automatically
+    (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST); the v2-style
+    constructor kwargs were removed.
+    """
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
     host = os.getenv("LANGFUSE_HOST")
@@ -55,11 +60,7 @@ def get_langfuse_handler() -> LangfuseCallbackHandler | None:
         print("[warn] Langfuse env vars not fully set — tracing disabled.")
         return None
 
-    return LangfuseCallbackHandler(
-        public_key=public_key,
-        secret_key=secret_key,
-        host=host,
-    )
+    return LangfuseCallbackHandler()
 
 
 # ---------------------------------------------------------------------------
@@ -74,8 +75,9 @@ def get_embeddings(
     base_url = base_url or _get_env("LOCAL_LLM_BASE_URL")
     return OpenAIEmbeddings(
         model=model,
-        openai_api_base=base_url,
-        openai_api_key="no-key-needed",  # local endpoint; key not required
+        base_url=base_url,
+        api_key="no-key-needed",  # local endpoint; key not required
+        check_embedding_ctx_length=False,
     )
 
 
@@ -87,8 +89,8 @@ def get_llm(
     return ChatOpenAI(
         model=model,
         temperature=temperature,
-        openai_api_base="http://localhost:4000/v1",
-        openai_api_key=_get_env("LITELLM_MASTER_KEY"),
+        base_url="http://localhost:4000/v1",
+        api_key=_get_env("LITELLM_MASTER_KEY"),
     )
 
 
@@ -145,24 +147,24 @@ def build_vectorstore(
     chunks: list,
     collection_name: str = "rag_documents",
     embeddings: OpenAIEmbeddings | None = None,
-) -> Qdrant:
+) -> QdrantVectorStore:
     """Embed *chunks* and upsert them into a Qdrant collection."""
     embeddings = embeddings or get_embeddings()
 
     qdrant_host = _get_env("QDRANT_HOST", "localhost")
     qdrant_port = int(_get_env("QDRANT_PORT", "6333"))
+    url = f"http://{qdrant_host}:{qdrant_port}"
 
-    vectorstore = Qdrant.from_documents(
+    vectorstore = QdrantVectorStore.from_documents(
         documents=chunks,
         embedding=embeddings,
-        host=qdrant_host,
-        port=qdrant_port,
+        url=url,
         collection_name=collection_name,
         force_recreate=True,
     )
     print(
         f"[info] Upserted {len(chunks)} chunk(s) into Qdrant "
-        f"collection '{collection_name}' at {qdrant_host}:{qdrant_port}"
+        f"collection '{collection_name}' at {url}"
     )
     return vectorstore
 
@@ -170,7 +172,7 @@ def build_vectorstore(
 def get_vectorstore(
     collection_name: str = "rag_documents",
     embeddings: OpenAIEmbeddings | None = None,
-) -> Qdrant:
+) -> QdrantVectorStore:
     """Connect to an existing Qdrant collection (no ingestion)."""
     from qdrant_client import QdrantClient
 
@@ -181,10 +183,10 @@ def get_vectorstore(
 
     client = QdrantClient(host=qdrant_host, port=qdrant_port)
 
-    return Qdrant(
+    return QdrantVectorStore(
         client=client,
         collection_name=collection_name,
-        embeddings=embeddings,
+        embedding=embeddings,
     )
 
 
@@ -205,7 +207,7 @@ Answer:"""
 
 
 def build_retrieval_chain(
-    vectorstore: Qdrant,
+    vectorstore: QdrantVectorStore,
     llm: ChatOpenAI | None = None,
     search_k: int = 4,
 ) -> RetrievalQA:

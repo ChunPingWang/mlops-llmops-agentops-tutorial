@@ -50,12 +50,24 @@ GUARDRAILS_URL = os.getenv("GUARDRAILS_URL", "http://localhost:8090")
 # ---------------------------------------------------------------------------
 
 
+def _embed_query(text: str) -> list[float]:
+    """Call the local LLM's OpenAI-compatible /embeddings endpoint."""
+    base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+    resp = httpx.post(
+        f"{base_url}/embeddings",
+        json={"model": "text-embedding", "input": [text]},
+        timeout=60.0,
+    )
+    resp.raise_for_status()
+    return resp.json()["data"][0]["embedding"]
+
+
 @tool
 def qdrant_search(query: str) -> str:
     """Search the Qdrant vector database for documents relevant to the query.
 
-    Connects to a Qdrant instance and performs a semantic search against
-    the 'rag_documents' collection.
+    Embeds the query via the local LLM /embeddings endpoint, then queries the
+    'rag_documents' collection (seeded by scripts/seed_qdrant.py).
 
     Args:
         query: The user question or search query.
@@ -63,27 +75,30 @@ def qdrant_search(query: str) -> str:
     try:
         client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
 
-        # Use Qdrant's built-in query (requires server-side embedding or
-        # a collection configured with a named vector).  Fall back to
-        # scroll if the collection uses custom embeddings.
         try:
-            results = client.query(
+            vector = _embed_query(query)
+            results = client.query_points(
                 collection_name=QDRANT_COLLECTION,
-                query_text=query,
+                query=vector,
                 limit=3,
+                with_payload=True,
             )
+            # query_points returns a QueryResponse whose .points is a list of
+            # ScoredPoint; each ScoredPoint has .payload and .score.
+            points = getattr(results, "points", results)
             documents: list[str] = []
-            for point in results:
-                payload = point.metadata if hasattr(point, "metadata") else {}
+            for point in points:
+                payload = getattr(point, "payload", None) or {}
                 text = payload.get("text", payload.get("content", str(payload)))
-                score = point.score if hasattr(point, "score") else "N/A"
+                score = getattr(point, "score", "N/A")
                 documents.append(f"[score={score}] {text}")
             if documents:
                 return "\n---\n".join(documents)
             return "No relevant documents found in Qdrant."
-        except Exception:
-            # Fallback: scroll first N records as context (useful when
-            # embeddings are managed externally).
+        except Exception as inner_exc:
+            # Fallback: scroll first N records as context (useful before the
+            # collection is seeded or when the embedding endpoint is down).
+            print(f"[qdrant_search] query_points failed ({inner_exc!s}); falling back to scroll")
             records, _ = client.scroll(
                 collection_name=QDRANT_COLLECTION,
                 limit=3,

@@ -129,7 +129,7 @@ def model_evaluation(
 
         mlflow.log_params(params)
         mlflow.log_metrics(metrics)
-        mlflow.sklearn.log_model(clf, artifact_path="model")
+        mlflow.sklearn.log_model(clf, name="model")
 
     context.log.info("Model metrics: %s", metrics)
 

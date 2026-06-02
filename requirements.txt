@@ -5,11 +5,16 @@ langchain-openai>=0.3.0
 langchain-community>=0.3.0
 langgraph>=0.4.0
 
-# Observability
-langfuse>=2.50.0
+# Observability — pin to v3 (v4 has breaking changes; v2 is missing
+# langfuse.langchain). All scripts in this repo use the v3 API.
+langfuse>=3,<4
 
-# Vector DB
-qdrant-client>=1.12.0
+# Vector DB — fastembed extra enables client.query(query_text=...)
+qdrant-client[fastembed]>=1.12.0
+langchain-qdrant>=0.2.0
+
+# HuggingFace datasets — required by ragas EvaluationDataset
+datasets>=3.0.0
 
 # RAG Evaluation
 ragas>=0.2.0

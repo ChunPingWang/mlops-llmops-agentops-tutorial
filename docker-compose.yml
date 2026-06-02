@@ -14,10 +14,12 @@ volumes:
   minio_data:
   mlflow_data:
   grafana_data:
+  open_webui_data:
+  dagster_data:
 
 services:
   # =============================================================================
-  # Infrastructure Services (7.2)
+  # Data layer (7.2)
   # =============================================================================
 
   postgres:
@@ -32,9 +34,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./configs/postgres/init-databases.sh:/docker-entrypoint-initdb.d/init-databases.sh
-    networks:
-      - data-net
-      - backend-net
+    networks: [data-net, backend-net]
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
@@ -49,9 +49,7 @@ services:
     env_file: .env
     volumes:
       - redis_data:/data
-    networks:
-      - data-net
-      - backend-net
+    networks: [data-net, backend-net]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -63,18 +61,24 @@ services:
     image: clickhouse/clickhouse-server:latest
     ports:
       - "127.0.0.1:8123:8123"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-changeme-clickhouse-password}
     env_file: .env
     volumes:
       - clickhouse_data:/var/lib/clickhouse
-    networks:
-      - data-net
-      - backend-net
+    networks: [data-net, backend-net]
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1'"]
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8123/ping || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   minio:
     image: minio/minio:latest
@@ -83,20 +87,43 @@ services:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minio123}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      # Allow Prometheus to scrape /minio/v2/metrics/cluster without a bearer token.
+      MINIO_PROMETHEUS_AUTH_TYPE: ${MINIO_PROMETHEUS_AUTH_TYPE:-public}
     env_file: .env
     volumes:
       - minio_data:/data
-    networks:
-      - data-net
-      - backend-net
+    networks: [data-net, backend-net]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # One-shot job: create the langfuse bucket inside MinIO so Langfuse v3
+  # event/media uploads have a destination on first boot.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: .env
+    networks: [data-net]
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minio-admin} ${MINIO_ROOT_PASSWORD};
+      mc mb --ignore-existing local/langfuse;
+      mc mb --ignore-existing local/mlflow;
+      mc mb --ignore-existing local/mem0;
+      echo 'MinIO buckets ready';
+      "
+    restart: "no"
+
+  # =============================================================================
+  # Observability
+  # =============================================================================
 
   prometheus:
     image: prom/prometheus:latest
@@ -105,8 +132,7 @@ services:
     env_file: .env
     volumes:
       - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
-    networks:
-      - backend-net
+    networks: [backend-net]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
@@ -123,9 +149,7 @@ services:
       - grafana_data:/var/lib/grafana
       - ./configs/grafana/provisioning:/etc/grafana/provisioning
       - ./configs/grafana/dashboards:/var/lib/grafana/dashboards
-    networks:
-      - frontend-net
-      - backend-net
+    networks: [frontend-net, backend-net]
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
@@ -134,19 +158,29 @@ services:
       retries: 5
 
   # =============================================================================
-  # Core Services (7.1)
+  # Core services (7.1)
   # =============================================================================
 
   litellm:
-    image: docker.litellm.ai/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:main-latest
     ports:
       - "0.0.0.0:4000:4000"
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY}
+      LITELLM_DATABASE_URL: ${LITELLM_DATABASE_URL}
+      LOCAL_LLM_BASE_URL: ${LOCAL_LLM_BASE_URL}
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_HOST: ${LANGFUSE_HOST}
+      AZURE_API_KEY: ${AZURE_API_KEY}
+      AZURE_API_BASE: ${AZURE_API_BASE}
+      AZURE_API_VERSION: ${AZURE_API_VERSION}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
     env_file: .env
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--host", "0.0.0.0"]
     volumes:
       - ./configs/litellm/config.yaml:/app/config.yaml
-    networks:
-      - frontend-net
-      - backend-net
+    networks: [frontend-net, backend-net]
     depends_on:
       postgres:
         condition: service_healthy
@@ -154,31 +188,48 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:4000/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:4000/health/liveliness || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
-  langfuse:
-    image: langfuse/langfuse:latest
+  # ---------------------------------------------------------------------------
+  # Langfuse v3 — split into web (UI/API) + worker (async event ingestion).
+  # ---------------------------------------------------------------------------
+  langfuse-web:
+    image: langfuse/langfuse:3
     ports:
       - "0.0.0.0:3100:3000"
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      DATABASE_URL: postgresql://langfuse:${POSTGRES_PASSWORD}@postgres:5432/langfuse
       NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3100}
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
       SALT: ${LANGFUSE_SALT}
-      CLICKHOUSE_URL: http://clickhouse:8123
-      LANGFUSE_S3_ENDPOINT: http://minio:9000
-      LANGFUSE_S3_BUCKET_NAME: langfuse
-      LANGFUSE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-minio}
-      LANGFUSE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio123}
-      REDIS_HOST: redis
-      REDIS_PORT: 6379
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: ${LANGFUSE_REDIS_CONNECTION_STRING:-redis://redis:6379}
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio-admin}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio-admin}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
     env_file: .env
-    networks:
-      - frontend-net
-      - backend-net
+    networks: [frontend-net, backend-net]
     depends_on:
       postgres:
         condition: service_healthy
@@ -186,46 +237,94 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      minio:
-        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/public/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 60s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    environment:
+      DATABASE_URL: postgresql://langfuse:${POSTGRES_PASSWORD}@postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_URL: ${LANGFUSE_CLICKHOUSE_URL:-http://clickhouse:8123}
+      CLICKHOUSE_MIGRATION_URL: ${LANGFUSE_CLICKHOUSE_MIGRATION_URL:-clickhouse://clickhouse:9000}
+      CLICKHOUSE_USER: ${LANGFUSE_CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_CONNECTION_STRING: ${LANGFUSE_REDIS_CONNECTION_STRING:-redis://redis:6379}
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: ${LANGFUSE_S3_EVENT_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio-admin}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: ${LANGFUSE_S3_MEDIA_UPLOAD_BUCKET:-langfuse}
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: ${LANGFUSE_S3_REGION:-auto}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: ${LANGFUSE_S3_ENDPOINT:-http://minio:9000}
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${LANGFUSE_S3_ACCESS_KEY_ID:-minio-admin}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_S3_SECRET_ACCESS_KEY}
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: ${LANGFUSE_S3_FORCE_PATH_STYLE:-true}
+    env_file: .env
+    networks: [backend-net]
+    depends_on:
+      langfuse-web:
+        condition: service_healthy
+    restart: unless-stopped
 
   qdrant:
     image: qdrant/qdrant:latest
     ports:
-      - "6333:6333"
+      # Bound to localhost like the other dev services; was 0.0.0.0 before.
+      - "127.0.0.1:6333:6333"
     env_file: .env
     volumes:
       - qdrant_data:/qdrant/storage
-    networks:
-      - backend-net
+    networks: [backend-net]
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:6333/healthz"]
+      # Qdrant's HTTP probe; works on both /healthz (old) and /readyz (new).
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:6333/readyz || wget --quiet --tries=1 --spider http://localhost:6333/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   nemo-guardrails:
-    image: nvcr.io/nvidia/nemo-guardrails:latest
+    # nvcr.io does NOT publish a public nemo-guardrails image. Build from
+    # the upstream pip package using configs/nemo-guardrails/Dockerfile.
+    build:
+      context: ./configs/nemo-guardrails
     ports:
-      - "8090:8090"
+      - "0.0.0.0:8090:8090"
+    environment:
+      GUARDRAILS_LLM_BASE_URL: ${GUARDRAILS_LLM_BASE_URL:-http://litellm:4000/v1}
+      # ${LITELLM_MASTER_KEY} IS expanded here because this is in environment:,
+      # not env_file:.
+      GUARDRAILS_LLM_API_KEY: ${LITELLM_MASTER_KEY}
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
     env_file: .env
     volumes:
       - ./configs/guardrails:/app/config
-    networks:
-      - backend-net
+    networks: [backend-net]
+    depends_on:
+      litellm:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8090/v1/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8090/v1/rails/configs || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
@@ -233,61 +332,113 @@ services:
       - "0.0.0.0:3080:8080"
     environment:
       OPENAI_API_BASE_URL: http://litellm:4000/v1
+      # Without OPENAI_API_KEY every request to LiteLLM returns 401.
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY}
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:-changeme-webui-secret}
     env_file: .env
-    networks:
-      - frontend-net
-      - backend-net
+    volumes:
+      - open_webui_data:/app/backend/data
+    networks: [frontend-net, backend-net]
+    depends_on:
+      litellm:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
-      interval: 10s
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/api/health"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
+  # ---------------------------------------------------------------------------
+  # MLflow — custom image with psycopg2 baked in.
+  # ---------------------------------------------------------------------------
   mlflow:
-    image: ghcr.io/mlflow/mlflow:latest
+    build:
+      context: ./configs/mlflow
     ports:
       - "0.0.0.0:5000:5000"
-    command: mlflow server --backend-store-uri postgresql://mlflow:${POSTGRES_PASSWORD}@postgres:5432/mlflow --host 0.0.0.0
+    command: >
+      mlflow server
+      --backend-store-uri postgresql://mlflow:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --artifacts-destination /mlflow/artifacts
+      --host 0.0.0.0
+      --port 5000
     env_file: .env
     volumes:
       - mlflow_data:/mlflow
-    networks:
-      - frontend-net
-      - backend-net
+    networks: [frontend-net, backend-net]
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:5000/health"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:5000/health || wget --quiet --tries=1 --spider http://localhost:5000/api/2.0/mlflow/experiments/search || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
+  # ---------------------------------------------------------------------------
+  # Dagster — webserver + daemon. Both mount the mlops/ project, share a
+  # dagster_home volume, and use Postgres-backed storage.
+  # ---------------------------------------------------------------------------
   dagster-webserver:
-    image: dagster/dagster-webserver:latest
+    build:
+      context: ./configs/dagster
     ports:
       - "0.0.0.0:3070:3000"
+    environment:
+      DAGSTER_HOME: /opt/dagster/dagster_home
+      DAGSTER_PG_HOST: ${DAGSTER_PG_HOST:-postgres}
+      DAGSTER_PG_PORT: ${DAGSTER_PG_PORT:-5432}
+      DAGSTER_PG_USER: ${DAGSTER_PG_USER:-dagster}
+      DAGSTER_PG_PASSWORD: ${DAGSTER_PG_PASSWORD}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
     env_file: .env
-    networks:
-      - frontend-net
-      - backend-net
+    command:
+      - dagster-webserver
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "3000"
+      - --workspace
+      - /opt/dagster/app/workspace.yaml
+    volumes:
+      - ./mlops:/opt/dagster/app
+      - ./configs/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml
+      - dagster_data:/opt/dagster/dagster_home/storage
+    networks: [frontend-net, backend-net]
     depends_on:
       postgres:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/server_info"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/server_info || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   dagster-daemon:
-    image: dagster/dagster-daemon:latest
+    build:
+      context: ./configs/dagster
+    environment:
+      DAGSTER_HOME: /opt/dagster/dagster_home
+      DAGSTER_PG_HOST: ${DAGSTER_PG_HOST:-postgres}
+      DAGSTER_PG_PORT: ${DAGSTER_PG_PORT:-5432}
+      DAGSTER_PG_USER: ${DAGSTER_PG_USER:-dagster}
+      DAGSTER_PG_PASSWORD: ${DAGSTER_PG_PASSWORD}
+      DAGSTER_PG_DB: ${DAGSTER_PG_DB:-dagster}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
     env_file: .env
-    networks:
-      - backend-net
+    command: ["dagster-daemon", "run"]
+    volumes:
+      - ./mlops:/opt/dagster/app
+      - ./configs/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml
+      - dagster_data:/opt/dagster/dagster_home/storage
+    networks: [backend-net]
     depends_on:
       postgres:
         condition: service_healthy
@@ -297,3 +448,4 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
+      start_period: 30s

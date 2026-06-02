@@ -7,10 +7,9 @@ scrape_configs:
       - targets: ["litellm:4000"]
     metrics_path: /metrics
 
-  - job_name: langfuse
-    static_configs:
-      - targets: ["langfuse:3100"]
-    metrics_path: /api/public/metrics
+  # Langfuse v3 no longer exposes /api/public/metrics. To restore metrics,
+  # enable the OTel exporter and point Prometheus at the worker service.
+  # Job removed until that wiring lands.
 
   - job_name: qdrant
     static_configs:
@@ -19,5 +18,10 @@ scrape_configs:
 
   - job_name: minio
     static_configs:
+      # MinIO container-internal port. Requires MINIO_PROMETHEUS_AUTH_TYPE=public
+      # on the minio service (set in docker-compose.yml).
       - targets: ["minio:9000"]
     metrics_path: /minio/v2/metrics/cluster
+
+  # Cadvisor/node-exporter style metrics from compose services can be added
+  # here as needed.

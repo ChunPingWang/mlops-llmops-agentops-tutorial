@@ -23,13 +23,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import pandas as pd
-from datasets import Dataset
-from ragas import evaluate
+from ragas import EvaluationDataset, evaluate
 from ragas.metrics import (
-    faithfulness,
-    answer_relevancy,
-    context_precision,
-    context_recall,
+    Faithfulness,
+    ResponseRelevancy,
+    LLMContextPrecisionWithReference,
+    LLMContextRecall,
 )
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
@@ -40,15 +39,19 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 # Test dataset
 # ---------------------------------------------------------------------------
 
+# Ragas 0.2 column names are user_input / response / retrieved_contexts /
+# reference. Older lowercase singletons (faithfulness etc.) accepted the
+# legacy question/answer/contexts/ground_truth schema with a deprecation
+# warning; the new metric classes require the new names.
 EVAL_DATA: dict[str, list] = {
-    "question": [
+    "user_input": [
         "What is retrieval-augmented generation?",
         "How does a vector database store documents?",
         "What are the benefits of using LLM observability tools?",
         "Explain the concept of embedding similarity search.",
         "What is prompt engineering?",
     ],
-    "answer": [
+    "response": [
         (
             "Retrieval-augmented generation (RAG) is a technique that combines "
             "a retrieval system with a generative language model. It first "
@@ -79,7 +82,7 @@ EVAL_DATA: dict[str, list] = {
             "thought reasoning, and system instructions."
         ),
     ],
-    "contexts": [
+    "retrieved_contexts": [
         [
             "RAG (Retrieval-Augmented Generation) enhances LLM responses by "
             "retrieving relevant documents from external knowledge bases before "
@@ -117,7 +120,7 @@ EVAL_DATA: dict[str, list] = {
             "prompts contain the specific question or task.",
         ],
     ],
-    "ground_truth": [
+    "reference": [
         (
             "RAG combines information retrieval with text generation. A "
             "retriever fetches relevant documents and the LLM uses them as "
@@ -163,8 +166,8 @@ def get_eval_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model="gemma-4-26b",
         temperature=0.0,
-        openai_api_base="http://localhost:4000/v1",
-        openai_api_key=_get_env("LITELLM_MASTER_KEY"),
+        base_url="http://localhost:4000/v1",
+        api_key=_get_env("LITELLM_MASTER_KEY"),
     )
 
 
@@ -173,13 +176,14 @@ def get_eval_embeddings() -> OpenAIEmbeddings:
     base_url = _get_env("LOCAL_LLM_BASE_URL")
     return OpenAIEmbeddings(
         model="text-embedding",
-        openai_api_base=base_url,
-        openai_api_key="no-key-needed",
+        base_url=base_url,
+        api_key="no-key-needed",
+        check_embedding_ctx_length=False,
     )
 
 
 def log_results_to_langfuse(results_df: pd.DataFrame) -> None:
-    """Log evaluation results to Langfuse as a score/trace if env vars are set."""
+    """Log evaluation results to Langfuse v3 as scores on a trace."""
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
     host = os.getenv("LANGFUSE_HOST")
@@ -191,21 +195,25 @@ def log_results_to_langfuse(results_df: pd.DataFrame) -> None:
     try:
         from langfuse import Langfuse
 
-        langfuse = Langfuse(
-            public_key=public_key,
-            secret_key=secret_key,
-            host=host,
-        )
+        langfuse = Langfuse()  # v3 reads creds from env
 
-        trace = langfuse.trace(name="ragas-evaluation")
-
-        # Log each metric as a score on the trace
-        for column in results_df.columns:
-            if column in ("question", "answer", "contexts", "ground_truth"):
-                continue
-            mean_value = results_df[column].mean()
-            trace.score(name=column, value=float(mean_value))
-            print(f"  [langfuse] Logged score {column} = {mean_value:.4f}")
+        # v3: create a trace via a context-managed span and attach scores
+        # to the current trace.
+        with langfuse.start_as_current_span(name="ragas-evaluation") as span:
+            for column in results_df.columns:
+                if column in (
+                    "user_input", "response", "retrieved_contexts", "reference",
+                ):
+                    continue
+                mean_value = results_df[column].mean()
+                if pd.isna(mean_value):
+                    continue
+                langfuse.score_current_trace(
+                    name=column,
+                    value=float(mean_value),
+                )
+                print(f"  [langfuse] Logged score {column} = {mean_value:.4f}")
+            span.update(output={"metrics_logged": True})
 
         langfuse.flush()
         print("[info] Evaluation results logged to Langfuse.")
@@ -224,8 +232,12 @@ def main():
     print("Ragas RAG Evaluation")
     print("=" * 60)
 
-    # Build HuggingFace Dataset from test data
-    dataset = Dataset.from_dict(EVAL_DATA)
+    # Build Ragas EvaluationDataset from test data. Ragas 0.2 expects a list
+    # of dicts with the keys user_input / response / retrieved_contexts /
+    # reference; from_list() converts our dict-of-lists.
+    rows = [dict(zip(EVAL_DATA.keys(), values))
+            for values in zip(*EVAL_DATA.values())]
+    dataset = EvaluationDataset.from_list(rows)
     print(f"[info] Test dataset: {len(dataset)} sample(s)")
 
     # Prepare LLM and embeddings wrappers for Ragas
@@ -234,10 +246,10 @@ def main():
 
     # Run evaluation
     metrics = [
-        faithfulness,
-        answer_relevancy,
-        context_precision,
-        context_recall,
+        Faithfulness(),
+        ResponseRelevancy(),
+        LLMContextPrecisionWithReference(),
+        LLMContextRecall(),
     ]
 
     print("[info] Running Ragas evaluation (this may take a few minutes)...")
@@ -257,10 +269,19 @@ def main():
 
     # Print summary
     print("\n--- Metric Averages ---")
-    metric_names = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
-    for metric in metric_names:
-        if metric in results_df.columns:
-            print(f"  {metric:25s}: {results_df[metric].mean():.4f}")
+    # Ragas 0.2 metric class names in DataFrame columns are class .name
+    # attribute (snake_case): faithfulness, answer_relevancy,
+    # llm_context_precision_with_reference, context_recall.
+    for metric in results_df.columns:
+        if metric in ("user_input", "response", "retrieved_contexts", "reference"):
+            continue
+        try:
+            mean = results_df[metric].mean()
+            if pd.isna(mean):
+                continue
+            print(f"  {metric:40s}: {mean:.4f}")
+        except (TypeError, ValueError):
+            continue
 
     # Optionally log to Langfuse
     log_results_to_langfuse(results_df)
