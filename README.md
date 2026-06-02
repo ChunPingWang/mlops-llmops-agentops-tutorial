@@ -814,6 +814,35 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 >
 > 同樣的問題會發生在 pipx——`pipx install` 的 venv 也不是 activated venv。
 >
+> #### OMLX chat 端點突然全部 500（embedding 卻 200）的兩個常見原因
+>
+> 實測踩過：embedding `/v1/embeddings` 一直 200 OK，但 chat `/v1/chat/completions` 對任何模型都回 500，響應時間 < 100ms（連模型推論都沒進到）。
+>
+> 看 OMLX terminal log，會看到類似這條 stack trace：
+> ```
+> RuntimeError: Model loading failed for <model>:
+>   Cannot find an appropriate cached snapshot folder for the specified
+>   revision on the local disk and outgoing traffic has been disabled.
+> ```
+>
+> 兩件事任一發生都會這樣：
+>
+> 1. **模型沒下載完整**：你 `hf download <id>` 中斷過，或從來沒下載過那個 model id。embeddings 用的是另一個模型，所以那邊不受影響。修法：
+>    ```bash
+>    hf download mlx-community/gemma-4-26b-a4b-it-4bit
+>    hf scan-cache | grep gemma     # 看 size ≥15 GB 且無 missing 警告
+>    ```
+>
+> 2. **`HF_HUB_OFFLINE=1` 或 `TRANSFORMERS_OFFLINE=1` 被設成 offline 模式**：HuggingFace Hub 連網被禁用。模型若**完全 cached** 還能 load；只要少一片就要連網而失敗。修法：
+>    ```bash
+>    env | grep -iE 'hf_|hugging|transformers'
+>    unset HF_HUB_OFFLINE TRANSFORMERS_OFFLINE
+>    grep -rE 'HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE' ~/.zshrc ~/.zprofile ~/.bash_profile 2>/dev/null
+>    # 如果 dotfile 有寫，把那行註解掉再開新 shell
+>    ```
+>
+> 兩條都修完重啟 mlx-omni-server，chat 就會恢復。
+>
 > #### `huggingface-cli` 已被改名為 `hf`
 >
 > 新的 CLI 是 `hf`（隨 `huggingface_hub` 一起裝）。舊命令仍能 import 但會印 deprecation 警告。**本 README 一律用 `hf`**：
@@ -892,17 +921,15 @@ curl -sS http://10.0.0.3:8000/v1/embeddings \
 
 選完之後在 `.env` 設 `EMBEDDING_MODEL=<id>`，並把 `scripts/seed_qdrant.py` 的 `VECTOR_SIZE` 對齊到該模型維度（**1024** 或 **384**）。
 
-#### A.4 退路：embeddings 仍 404 時，跑獨立 server
+#### A.4 退路：embeddings 仍 404 時
 
-如果升級完還是 404（代表這個 build 的 router 真沒掛起來），用 `mlx-embeddings` 本身的 server 跑在另一個 port：
-
+如果升級完還是 404，代表你的 mlx-omni-server 版本太舊（embeddings router 還沒加入）。**先升到最新版**：
 ```bash
-pip install -U mlx-embeddings
-python -m mlx_embeddings.server --host 0.0.0.0 --port 8001 \
-  --model mlx-community/mxbai-embed-large-v1
+source ~/.venvs/omlx/bin/activate
+uv pip install -U mlx-omni-server mlx-embeddings
 ```
 
-然後在 `configs/litellm/config.yaml` 把 `text-embedding` 模型的 `api_base` 改指 `http://10.0.0.3:8001/v1`，chat 維持 `:8000`。
+> ⚠️ **注意**：`mlx-embeddings` 套件本身**沒有** `.server` 模組（它是 library，不是 server）；網路上有些教學提到 `python -m mlx_embeddings.server` **是錯的**，會出 `No module named mlx_embeddings.server`。要拆 embedding server 唯一可靠的辦法是另一個 mlx-omni-server process 跑在不同 port（兩個 venv / 不同 HF cache 也行），用 LiteLLM `model_list` 兩條 `api_base` 接過去。但**多數情況不需要拆**——一個 mlx-omni-server 同時服務 chat + embedding 完全可行（A.1 已驗證）。
 
 ### B. Linux + GPU — vLLM 路線
 
