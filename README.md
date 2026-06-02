@@ -796,6 +796,32 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 > ```
 > 同理 pipx 用 `pipx uninstall mlx-omni-server` 再裝。
 >
+> #### `uv tool` venv 在 runtime auto-install 場景會失敗
+>
+> 實測：mlx-omni-server（透過 transitive deps，疑似 outlines / mlx-vlm 拉進的 spacy）啟動時會嘗試自動下載 spacy 模型，並 **shell-out 呼叫 `uv pip install ...`**。但 `uv tool` 開的 venv 只給 uv tool 子系統用，**對 shell-out 的子 process 不可見**——子 process 找不到 `VIRTUAL_ENV`、找不到 `pyproject.toml`，就回：
+> > `error: No virtual environment found; run 'uv venv' to create an environment, or pass '--system' to install into a non-virtual environment`
+>
+> 解法：**改用自己 activate 的常駐 venv**（不要用 `uv tool`），這樣所有 child process 都繼承 `$VIRTUAL_ENV`：
+> ```bash
+> uv tool uninstall mlx-omni-server  # 清掉
+> uv venv --python 3.12 ~/.venvs/omlx
+> source ~/.venvs/omlx/bin/activate
+> uv pip install mlx-omni-server mlx-embeddings
+> python -m spacy download en_core_web_sm   # 先補可能被 auto-install 的模型
+> mlx-omni-server --host 0.0.0.0 --port 8000  # 必須在 activated venv 內啟動
+> ```
+> 寫個 alias 省事：`alias omlx='source ~/.venvs/omlx/bin/activate && mlx-omni-server --host 0.0.0.0 --port 8000'`
+>
+> 同樣的問題會發生在 pipx——`pipx install` 的 venv 也不是 activated venv。
+>
+> #### `huggingface-cli` 已被改名為 `hf`
+>
+> 新的 CLI 是 `hf`（隨 `huggingface_hub` 一起裝）。舊命令仍能 import 但會印 deprecation 警告。**本 README 一律用 `hf`**：
+> ```bash
+> hf download mlx-community/mxbai-embed-large-v1
+> # 等價於舊版 huggingface-cli download ...
+> ```
+>
 > #### 為什麼是 Python 3.12 而不是 3.14？
 >
 > Python 3.14 是 2025-10 才 release 的，含 native extension 的套件（Rust via pyo3、C via Cython、C++ via pybind11）每個都要重 build wheel 才能上 PyPI。ML 生態通常**落後 Python 主線 6–12 個月**。判斷準則：
@@ -808,18 +834,21 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 > | ≤3.10 | EOL 或接近 EOL | 不要 |
 
 ```bash
-# 用 uv 一次裝齊（chat 與 embedding 共用同一個 isolated env）
-# --python 3.12 避免踩到 Python 3.14 的 wheel 缺漏
+# 用 venv 而非 uv tool（理由見上方框）
 brew install uv
-uv tool install --python 3.12 mlx-omni-server --with mlx-embeddings
+uv venv --python 3.12 ~/.venvs/omlx
+source ~/.venvs/omlx/bin/activate
+uv pip install mlx-omni-server mlx-embeddings
+python -m spacy download en_core_web_sm   # 預先補 spacy 模型，避免 runtime auto-install 觸發 uv pip 失敗
 
-# 預先 pull 一個 chat 模型（不下也行，首次請求會自動下載）
-huggingface-cli download mlx-community/gemma-4-26b-a4b-it-4bit
+# 預先 pull chat + embedding 模型（不下也行，首次請求會自動下載）
+hf download mlx-community/gemma-4-26b-a4b-it-4bit
+hf download mlx-community/mxbai-embed-large-v1
 
-# 啟動 server（綁 0.0.0.0 才能讓其他機器存取）
+# 啟動 server（必須在 activated venv 內！綁 0.0.0.0 才能讓 Docker host 連上）
 mlx-omni-server --host 0.0.0.0 --port 8000
 
-# 測試
+# 開另一個 terminal 測試
 curl http://127.0.0.1:8000/v1/models | jq '.data[].id'
 ```
 
@@ -831,13 +860,12 @@ mlx-omni-server **支援** `/v1/embeddings`，但 router 只在 `mlx-embeddings`
 
 ```bash
 # 1. 升級 server 並補上 embeddings 套件
-#    （如果 A.1 已用 uv tool install --python 3.12 ... --with mlx-embeddings，這步可跳過）
-uv tool install --python 3.12 --upgrade mlx-omni-server --with mlx-embeddings
-# pipx 版本: pipx upgrade mlx-omni-server && pipx inject mlx-omni-server mlx-embeddings --force
-# venv 版本: source ~/.venvs/omlx/bin/activate && pip install -U mlx-omni-server mlx-embeddings
+#    （A.1 venv 流程已包含這兩個，這步只有後來才想加 embedding 時才需要）
+source ~/.venvs/omlx/bin/activate
+uv pip install -U mlx-omni-server mlx-embeddings
 
 # 2. 預先 pull 一個 embedding 模型
-huggingface-cli download mlx-community/mxbai-embed-large-v1
+hf download mlx-community/mxbai-embed-large-v1
 
 # 3. 重啟 server（不必加 --model 等 flag；router 看到套件就自動掛載）
 pkill -f mlx-omni-server 2>/dev/null
