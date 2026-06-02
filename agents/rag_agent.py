@@ -19,6 +19,7 @@ from langgraph.graph import END, START, StateGraph
 from qdrant_client import QdrantClient
 from typing_extensions import TypedDict
 
+from langfuse import get_client as _langfuse_client
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
 load_dotenv()
@@ -311,7 +312,7 @@ def main() -> None:
     print(f"  Answer (first 500 chars):")
     print(f"    {final_state['generated_answer'][:500]}")
 
-    langfuse_handler.flush()
+    _langfuse_client().flush()
 
 
 if __name__ == "__main__":

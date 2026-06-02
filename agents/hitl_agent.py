@@ -17,6 +17,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from typing_extensions import TypedDict
 
+from langfuse import get_client as _langfuse_client
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
 load_dotenv()
@@ -184,8 +185,12 @@ def main() -> None:
         config=thread_config,
         stream_mode="updates",
     ):
-        for node_name, update in step.items():
-            print(f"  [stream] node={node_name}, keys={list(update.keys())}")
+        # LangGraph 0.4+ can yield tuples (namespace, payload) when nested
+        # subgraphs or interrupts are involved, not just plain dicts.
+        items = step.items() if isinstance(step, dict) else [(("__interrupt__",), step)]
+        for node_name, update in items:
+            keys = list(update.keys()) if isinstance(update, dict) else type(update).__name__
+            print(f"  [stream] node={node_name}, keys={keys}")
     print()
 
     # Inspect the paused state
@@ -208,8 +213,12 @@ def main() -> None:
         config=thread_config,
         stream_mode="updates",
     ):
-        for node_name, update in step.items():
-            print(f"  [stream] node={node_name}, keys={list(update.keys())}")
+        # LangGraph 0.4+ can yield tuples (namespace, payload) when nested
+        # subgraphs or interrupts are involved, not just plain dicts.
+        items = step.items() if isinstance(step, dict) else [(("__interrupt__",), step)]
+        for node_name, update in items:
+            keys = list(update.keys()) if isinstance(update, dict) else type(update).__name__
+            print(f"  [stream] node={node_name}, keys={keys}")
     print()
 
     # Final state
@@ -222,7 +231,7 @@ def main() -> None:
     print(f"  Execution result (first 200 chars):")
     print(f"    {final_state.values.get('execution_result', '')[:200]}")
 
-    langfuse_handler.flush()
+    _langfuse_client().flush()
 
 
 if __name__ == "__main__":

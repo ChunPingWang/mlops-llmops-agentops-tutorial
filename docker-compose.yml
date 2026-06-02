@@ -188,7 +188,9 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:4000/health/liveliness || exit 1"]
+      # litellm image is slim Python — no wget/curl. Use bash /dev/tcp/ to
+      # confirm the API port is accepting connections.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/4000' >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -202,6 +204,20 @@ services:
     ports:
       - "0.0.0.0:3100:3000"
     environment:
+      # Make Next.js bind on 0.0.0.0 (default is the container's eth0 IP only,
+      # which breaks loopback healthchecks).
+      HOSTNAME: "0.0.0.0"
+      # Auto-bootstrap a default org/project/user/api-key on first startup.
+      # Once provisioned these keys are deterministic across restarts.
+      LANGFUSE_INIT_ORG_ID: "poc-org"
+      LANGFUSE_INIT_ORG_NAME: "PoC Org"
+      LANGFUSE_INIT_PROJECT_ID: "poc-project"
+      LANGFUSE_INIT_PROJECT_NAME: "PoC Project"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-admin@example.com}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-PoC Admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-changeme-langfuse-password}
       DATABASE_URL: postgresql://langfuse:${POSTGRES_PASSWORD}@postgres:5432/langfuse
       NEXTAUTH_URL: ${LANGFUSE_NEXTAUTH_URL:-http://localhost:3100}
       NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
@@ -241,7 +257,10 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      # Langfuse v3 (Next.js standalone) binds to the container's eth0 IP,
+      # NOT to 127.0.0.1 / localhost. Use $HOSTNAME which resolves via
+      # /etc/hosts to that exact interface.
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://$$HOSTNAME:3000/api/public/health || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -292,8 +311,9 @@ services:
     networks: [backend-net]
     restart: unless-stopped
     healthcheck:
-      # Qdrant's HTTP probe; works on both /healthz (old) and /readyz (new).
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:6333/readyz || wget --quiet --tries=1 --spider http://localhost:6333/healthz || exit 1"]
+      # Qdrant image ships only bash/sh — no wget/curl. Use bash /dev/tcp/
+      # to confirm the HTTP port is accepting connections.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/6333' >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -320,7 +340,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8090/v1/rails/configs || exit 1"]
+      # slim Python base has no wget. TCP check on the API port.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8090' >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -344,7 +365,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/api/health"]
+      # Open WebUI image lacks wget. TCP check on the API port.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/8080' >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -373,7 +395,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:5000/health || wget --quiet --tries=1 --spider http://localhost:5000/api/2.0/mlflow/experiments/search || exit 1"]
+      # mlflow image lacks wget/curl. Use bash /dev/tcp/ for liveness.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/5000' >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -415,7 +438,8 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:3000/server_info || exit 1"]
+      # dagster-webserver slim image lacks wget/curl. TCP check on the API port.
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/3000' >/dev/null 2>&1 || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 10
@@ -434,6 +458,8 @@ services:
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
     env_file: .env
     command: ["dagster-daemon", "run"]
+    # NOTE: dagster-daemon doesn't have a 'health-check' subcommand. The
+    # actual subcommand is 'liveness-check' (since dagster 1.4+).
     volumes:
       - ./mlops:/opt/dagster/app
       - ./configs/dagster/dagster.yaml:/opt/dagster/dagster_home/dagster.yaml
@@ -444,7 +470,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "dagster-daemon", "health-check"]
+      test: ["CMD", "dagster-daemon", "liveness-check"]
       interval: 30s
       timeout: 10s
       retries: 5

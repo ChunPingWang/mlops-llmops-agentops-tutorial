@@ -19,6 +19,7 @@ from langchain.tools import tool
 from langgraph.graph import END, START, StateGraph
 from typing_extensions import TypedDict
 
+from langfuse import get_client as _langfuse_client
 from langfuse.langchain import CallbackHandler as LangfuseCallbackHandler
 
 load_dotenv()
@@ -185,7 +186,8 @@ def main() -> None:
     final_answer = final_state["messages"][-1].content
     print(f"Final Answer: {final_answer}")
 
-    langfuse_handler.flush()
+    # v3 LangchainCallbackHandler has no .flush(); use the global client.
+    _langfuse_client().flush()
 
 
 if __name__ == "__main__":

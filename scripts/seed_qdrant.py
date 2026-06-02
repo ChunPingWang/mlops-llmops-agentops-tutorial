@@ -115,8 +115,14 @@ def get_embeddings(texts: list[str]) -> list[list[float]]:
         "input": texts,
     }
 
+    # OMLX/mlx-omni-server requires Authorization: Bearer <key>.
+    headers = {}
+    api_key = os.getenv("OMLX_API_KEY") or os.getenv("LOCAL_LLM_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
     print(f"[info] Requesting embeddings from {url} for {len(texts)} text(s)...")
-    response = httpx.post(url, json=payload, timeout=60.0)
+    response = httpx.post(url, json=payload, headers=headers, timeout=60.0)
     response.raise_for_status()
 
     data = response.json()

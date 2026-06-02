@@ -297,10 +297,12 @@ class PoCVerificationTests(unittest.TestCase):
             self.skipTest("Langfuse keys not configured")
         try:
             with httpx.Client(timeout=TIMEOUT) as client:
+                # Langfuse v3 removed /api/public/generations; generations are
+                # surfaced via /observations?type=GENERATION.
                 resp = client.get(
-                    f"{LANGFUSE_URL}/api/public/generations",
+                    f"{LANGFUSE_URL}/api/public/observations",
                     auth=(LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY),
-                    params={"limit": 5},
+                    params={"limit": 5, "type": "GENERATION"},
                 )
                 self.assertEqual(resp.status_code, 200, f"Got {resp.status_code}")
                 body = resp.json()
@@ -352,14 +354,20 @@ class PoCVerificationTests(unittest.TestCase):
                     f"Create prompt returned {create_resp.status_code}: {create_resp.text}",
                 )
 
-                # Retrieve the prompt
+                # Retrieve the prompt. Langfuse v3 expects ?name=<name> as a
+                # filter on the list endpoint; the /{name} path segment 404s.
                 get_resp = client.get(
-                    f"{LANGFUSE_URL}/api/public/v2/prompts/{prompt_name}",
+                    f"{LANGFUSE_URL}/api/public/v2/prompts",
                     auth=auth,
+                    params={"name": prompt_name},
                 )
                 self.assertEqual(get_resp.status_code, 200, f"Got {get_resp.status_code}")
                 body = get_resp.json()
-                self.assertEqual(body.get("name"), prompt_name)
+                names = [p.get("name") for p in body.get("data", [])]
+                self.assertIn(
+                    prompt_name, names,
+                    f"Newly created prompt {prompt_name!r} not found in list: {names[:5]}",
+                )
             _record(code, "PASS")
         except httpx.ConnectError:
             _record(code, "SKIP", "Langfuse unreachable")
@@ -585,7 +593,11 @@ class PoCVerificationTests(unittest.TestCase):
         code = "V-20"
         try:
             with httpx.Client(timeout=TIMEOUT) as client:
-                resp = client.get(f"{MLFLOW_URL}/api/2.0/mlflow/experiments/search")
+                # MLflow 2.17+ requires max_results > 0; default 0 returns 400.
+                resp = client.get(
+                    f"{MLFLOW_URL}/api/2.0/mlflow/experiments/search",
+                    params={"max_results": 10},
+                )
                 self.assertEqual(resp.status_code, 200, f"Got {resp.status_code}")
                 body = resp.json()
                 # Should have an 'experiments' key

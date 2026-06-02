@@ -285,7 +285,9 @@ def main():
 
     # Flush Langfuse events
     if langfuse_handler:
-        langfuse_handler.flush()
+        # v3 LangchainCallbackHandler has no .flush(); use the global client.
+        from langfuse import get_client
+        get_client().flush()
         print("\n[info] Langfuse traces flushed.")
 
     print("\nDone.")

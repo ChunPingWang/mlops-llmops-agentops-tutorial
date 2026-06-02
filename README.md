@@ -129,6 +129,14 @@
 
 **Fallback 機制：** 當本地 Gemma 4 回應逾時或出錯時，LiteLLM 會自動把請求轉發給 Azure OpenAI。你的應用程式完全不需要知道這件事。
 
+#### 更深入：路由演算法與成本計算
+
+`router_settings.fallbacks` 是「全有全無」的鏈式 fallback；同一個 `model_name` 下定義多個 deployment 還可以做負載平衡（`routing_strategy: usage-based-routing`、`simple-shuffle`、`least-busy` 三種）。
+
+成本是怎麼算出來的？LiteLLM 內建一份 [model price map](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window_backup.json)，每筆請求結束後用 `(input_tokens × input_cost_per_token) + (output_tokens × output_cost_per_token)` 推算金額，再透過 `success_callback` 送到 Langfuse。本地模型成本為 0（map 裡的 `input_cost_per_token=0`），但 token 數仍會被記錄。
+
+`callbacks: ["prometheus"]` 一開，`/metrics` 就會多出 `litellm_requests_total`、`litellm_request_duration_seconds_bucket`、`litellm_total_tokens` 等指標，Grafana 上的 LLMOps 面板就靠這幾個。
+
 ---
 
 ### 2. Langfuse — LLM 可觀測性
@@ -161,6 +169,38 @@
 
 **TTFT (Time to First Token)：** 使用者按下送出後，看到第一個字出現的時間。這是最影響使用體驗的指標。
 
+#### 更深入：Langfuse v3 為什麼要五個後端？
+
+v2 時代 Langfuse 是單一 Postgres 應用；v3 為了支撐高吞吐量 trace ingest 拆成「Web + Worker」兩個容器，加上四種儲存：
+
+| 儲存 | 角色 | 沒有會怎樣 |
+|------|------|-----------|
+| **PostgreSQL** | 設定、使用者、Prompt 版本（強一致） | 服務無法啟動（Prisma migration 跑不起來） |
+| **ClickHouse** | Trace / Span / Generation 事件（千萬筆級高速分析） | 看不到任何 trace；UI 大部分頁面空白 |
+| **Redis** | Web↔Worker 任務佇列、Rate Limit、Cache | Worker 收不到工作，事件卡在 Web |
+| **S3 / MinIO** | 大型 payload（>1MB prompt、附件、media） | 大型 trace 截斷或丟失 |
+
+`LANGFUSE_ENCRYPTION_KEY` 是 64 字元的 hex（`openssl rand -hex 32` 產生），用來加密 API key 等敏感欄位寫入 Postgres。一旦遺失，舊資料無法解密。
+
+#### 更深入：v3 SDK 的 OpenTelemetry-aware API
+
+```python
+from langfuse import Langfuse
+lf = Langfuse()  # 從 LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_HOST 讀
+
+with lf.start_as_current_span(name="rag-pipeline") as span:
+    # ↓ 任何同 thread 內的 span 都自動成為這個 span 的子節點
+    with lf.start_as_current_span(name="retrieve") as r:
+        r.update(input={"q": question}, output=docs)
+    with lf.start_as_current_generation(name="llm-call", model="gemma-4-26b") as g:
+        g.update(input=prompt, output=answer, usage={"input": 856, "output": 234})
+
+    lf.score_current_trace(name="faithfulness", value=0.85)
+lf.flush()  # 程序結束前確保事件送出
+```
+
+舊 v2 的 `lf.trace(...).span(...)` / `span.end(output=...)` 在 v3 已移除——本專案的 `agents/mem0_agent.py` 與 `rag/eval_ragas.py` 就是踩到這個遷移坑的範例。
+
 ---
 
 ### 3. Qdrant — 向量資料庫
@@ -187,6 +227,32 @@
 
 **為什麼不直接把整份 PDF 給 LLM？** 因為 LLM 有 Token 上限（也更貴），而且找到最相關的段落比整份文件更能產生精確的回答。
 
+#### 更深入：HNSW 為何能在百萬向量上維持 sub-ms 檢索？
+
+Qdrant 預設使用 **HNSW（Hierarchical Navigable Small World）** 索引——把所有向量組成多層稀疏圖，上層連結遠端鄰居（高速跳躍）、下層連結近端鄰居（精細逼近）。搜尋從最上層的入口點開始 greedy 走訪，逐層下降，每次只比較常數個鄰居。複雜度從 brute-force 的 O(N·d) 降到 O(log N · d)。
+
+代價：HNSW 索引本身會吃掉 1.5–2× 向量本體的記憶體（圖結構）。Qdrant 提供三種壓縮抵消：
+
+| 量化 | 縮小 | 召回率影響 | 適用場景 |
+|------|------|-----------|---------|
+| **Scalar (int8)** | 4× | <1% | 大多數場景的安全預設 |
+| **Product (PQ)** | 16–64× | 1–5% | 超大語料 / 記憶體有限 |
+| **Binary** | 32× | 視資料而定 | 需先 rerank 才實用 |
+
+#### 更深入：選哪一種距離度量？
+
+| 距離 | 公式直覺 | 用在 |
+|------|---------|------|
+| **Cosine**（本專案） | 兩向量夾角 | OpenAI / sentence-transformers 多數模型 |
+| **Dot product** | Cosine × magnitudes | 已正規化 + 想保留 magnitude 訊號 |
+| **Euclidean** | 兩點直線距離 | 影像 / 數值特徵，較少用於文字 |
+
+選錯距離，模型在訓練時學到的「相似」就不再對應到資料庫的「相近」——召回率可能掉到隨機水準。
+
+#### 更深入：Hybrid Search（為什麼純向量不夠）
+
+純語意搜尋對「精確關鍵字」（產品型號、人名、版本號）表現很弱。生產 RAG 多半把 BM25/keyword 結果與向量結果加權合併（RRF, Reciprocal Rank Fusion）。Qdrant 從 1.10 起支援 sparse vector + dense vector 在同一個 collection 內共存查詢。
+
 ---
 
 ### 4. NeMo Guardrails — 安全護欄
@@ -212,6 +278,42 @@
 ```
 
 **PII（個人識別資訊）：** 信用卡號、身分證號、社會安全碼等。Guardrails 會偵測這些模式並阻止處理。
+
+#### 更深入：Colang —— 給對話流程的 DSL
+
+NeMo 用一個叫 **Colang** 的 DSL 描述 rails，分為 1.0（YAML 風格）與 2.0（類 Python）。本專案 pin `colang_version: "1.0"`：
+
+```colang
+# configs/guardrails/rails/pii.co
+define user contains pii
+  "My credit card number is 4111-1111-1111-1111"  # ← few-shot 範例，用語意比對
+  "My ID number is A123456789"
+
+define flow pii filter input          # ← 流程
+  user contains pii                   # ← 條件
+  bot refuse pii                      # ← 動作（呼叫下面定義的 bot intent）
+  stop                                # ← 不要繼續送給 LLM
+
+define bot refuse pii
+  "我偵測到敏感資訊，請移除後再試。"
+```
+
+執行期：使用者輸入 → embedding → 與所有 `define user ...` 範例比語意相似度 → 落在哪個 intent → 觸發對應 flow。
+
+#### 更深入：四種 Rail 層級
+
+| Rail | 攔截點 | 例子 |
+|------|--------|------|
+| **input rails** | LLM 收到前 | PII 偵測、jailbreak 偵測 |
+| **dialog rails** | LLM 推論過程 | 強制走特定話術、轉接人工 |
+| **output rails** | LLM 回應後 | 拒答話題、自我審查、敏感字過濾 |
+| **retrieval rails** | RAG 取回後 | 過濾不該被引用的文件 |
+
+「防禦縱深」的精神：input 擋 90%，output 擋 9%，dialog/retrieval 擋剩下 1%。單一層永遠會被繞過。
+
+#### 更深入：為什麼不直接靠 system prompt？
+
+System prompt 是「軟」約束，使用者只要 jailbreak（角色扮演、提示注入）就可能繞過。Guardrails 是「硬」約束——攔截在 LLM 之外的獨立流程，使用者根本看不到也碰不到。兩者搭配才完整。
 
 ---
 
@@ -246,6 +348,31 @@ Agent 執行流程：
 ```
 
 這在高風險場景很重要：例如 Agent 要發送郵件或修改資料庫時，先讓人確認。
+
+#### 更深入：StateGraph 的核心模型
+
+LangGraph 把 Agent 抽象成「狀態 + 圖」：
+
+```python
+class AgentState(TypedDict):
+    messages: Annotated[list[AnyMessage], operator.add]   # ← 累積策略：append
+    # 不寫 Annotated 的欄位則是「覆蓋策略」
+```
+
+每個 node 是一個 `State -> dict` 的 pure function，回傳要更新的欄位。Annotated 的 reducer 決定怎麼合併（add、replace、custom merge）。這比 LangChain 0.1 時代的 `AgentExecutor` + `MessagesPlaceholder` 大量隱式狀態好除錯非常多——所有狀態變動都看得到、都可重播。
+
+#### 更深入：Checkpointing —— Agent 為什麼能「暫停」
+
+`MemorySaver` 只是 in-process dict；正式環境用 `PostgresSaver` 或 `SqliteSaver`。每執行一個 node，graph 把 (thread_id, checkpoint_id, state, next_nodes) 寫入 checkpointer。HITL 的 `interrupt()` 把 graph 凍結在某個 node，狀態落地到 checkpointer；外部呼叫 `graph.stream(Command(resume=...))` 就從那個檢查點接續執行——重啟程序也不會丟。
+
+#### 更深入：四種 stream 模式
+
+| stream_mode | 拿到什麼 | 適合 |
+|-------------|---------|------|
+| `values` | 完整 state 快照 | 想看整體狀態演進 |
+| `updates`（本專案常用） | 每個 node 的部分更新 | UI 即時顯示「Agent 在做什麼」 |
+| `messages` | LLM token-by-token 流 | 對話 UI 的打字機效果 |
+| `debug` | 內部事件（含 reducer 細節） | 除錯 |
 
 ---
 
@@ -292,6 +419,29 @@ iris-classifier
 └── Version 3 → Stage: Production（正式上線）
 ```
 
+#### 更深入：Stages 已過時，改用 Aliases
+
+MLflow 2.9 起 stages（Staging/Production）被標記 deprecated，3.x 直接移除。新模型是 **Alias**——一個可改名的指標：
+
+```python
+client.set_registered_model_alias("iris-classifier", alias="staging",    version=4)
+client.set_registered_model_alias("iris-classifier", alias="production", version=3)
+# 載入時用 alias 引用：
+model = mlflow.sklearn.load_model("models:/iris-classifier@production")
+```
+
+Alias 是 **指標**（mutable pointer），同一個 version 可以同時被多個 alias 指——例如同時是 `production` 與 `champion`。本專案 `mlops/mlflow_experiment.py` 就是改用 alias 寫的。
+
+#### 更深入：Backend / Artifact / Registry 三層
+
+| 層 | 存什麼 | 本專案怎麼存 |
+|----|--------|------------|
+| **Tracking backend** | runs、params、metrics、tags（小資料） | Postgres（`--backend-store-uri postgresql://...`） |
+| **Artifact store** | 模型成品、圖檔、CSV（大資料） | 容器內 volume `/mlflow/artifacts`（正式環境改用 S3/MinIO） |
+| **Model registry** | RegisteredModel + Version + Alias | 共用 Tracking backend 的 Postgres |
+
+注意 `ghcr.io/mlflow/mlflow` 原始映像 **不含 psycopg2**——直接用 `--backend-store-uri postgresql://` 會炸。本專案的 `configs/mlflow/Dockerfile` 就為了塞 `psycopg2-binary` 而存在。
+
 ---
 
 ### 8. Dagster — 管線編排
@@ -314,6 +464,41 @@ iris-classifier
 ```
 
 Dagster 確保：步驟按順序執行、失敗時重試、可以排程（每天凌晨跑一次）。
+
+#### 更深入：Software-Defined Assets vs 任務 DAG
+
+Airflow 把世界看成「任務」：「11:00 跑 SQL」「12:00 跑 Python」——你寫的是動作。
+Dagster 把世界看成「**資產**」：「`customer_features` 表是 `raw_events` 表透過 group-by 推得」——你寫的是依賴。
+
+```python
+@asset
+def raw_data(context) -> pd.DataFrame: ...           # ← 我產生 raw_data
+
+@asset
+def feature_engineered_data(raw_data) -> pd.DataFrame:  # ← 我需要 raw_data
+    return raw_data.assign(...)
+```
+
+Dagster 從函式簽名自動推出 DAG，不用手寫 `set_upstream`。Web UI 顯示的也是「資產之間的依賴圖」，而非「任務的時間表」——對 ML/RAG/Data 工作流程更直觀。
+
+#### 更深入：Materialize、Backfill、Sensor
+
+| 動作 | 意思 |
+|------|------|
+| **Materialize** | 跑一次 asset 的計算，把結果寫進它的 storage |
+| **Backfill** | 對「歷史分區」批次 materialize（例如「重跑過去 30 天的每日 asset」） |
+| **Sensor** | 偵測外部事件（檔案落地、S3 物件、Kafka 訊息）自動觸發 |
+| **Schedule** | 純時間觸發（cron） |
+
+#### 更深入：dagster.yaml 與工作區掛載
+
+Dagster 容器啟動時需要：
+
+1. **`DAGSTER_HOME`**：實例設定根目錄（本專案 `/opt/dagster/dagster_home`）。
+2. **`dagster.yaml`**：定義儲存後端（runs/events/schedules → Postgres 還是 SQLite）。沒設 → 預設用 ephemeral SQLite，重啟全丟。
+3. **`workspace.yaml`**：告訴 webserver/daemon 去哪載入 `@asset` 函式。
+
+本專案 mount `./mlops:/opt/dagster/app`，並在 `configs/dagster/dagster.yaml` 指定 Postgres 後端。
 
 ---
 
@@ -338,6 +523,35 @@ Grafana (視覺化)
     └── Fallback 觸發次數
 ```
 
+#### 更深入：Pull 模型 vs Push 模型
+
+Prometheus 走 **Pull** 模型——它主動去每個 target 抓 `/metrics`。優點：
+
+- Target 不知道 Prometheus 存在，零配置即可被監控
+- Target 死掉 → 抓不到 → 自動產生 `up == 0` 告警
+- 重啟 Prometheus 不會掉資料（reset 在 scraper 而非 emitter）
+
+對比 push（StatsD/Datadog Agent）：需要每個 service 主動發送，service 自己要管 retry/buffer/backpressure。但 push 適合短命任務（batch job 跑完就退出，沒人來 pull）—— Prometheus 的解法是 **Pushgateway**。
+
+#### 更深入：PromQL 三個必懂的函式
+
+```promql
+# 1. rate(): 把 counter 變成「每秒增量」
+rate(litellm_requests_total[5m])
+
+# 2. histogram_quantile(): 從 *_bucket 估算 p95 / p99 延遲
+histogram_quantile(0.95, rate(litellm_request_duration_seconds_bucket[5m]))
+
+# 3. sum by(): 按標籤聚合（如按模型分組）
+sum by(model) (rate(litellm_requests_total[5m]))
+```
+
+本專案 `configs/grafana/dashboards/llmops-overview.json` 主要就靠這三個函式。
+
+#### 更深入：Grafana datasource UID 必須對齊
+
+Dashboard JSON 裡每個 panel 都用 `"datasource": {"uid": "prometheus"}` 引用資料源；如果 `configs/grafana/provisioning/datasources/datasource.yml` 沒明確指定 `uid: prometheus`，Grafana 會給隨機 UID，整張 dashboard 就會「找不到資料源」——這是本 PoC 的 H1 修復項。
+
 ---
 
 ### 10. 支援元件
@@ -348,6 +562,89 @@ Grafana (視覺化)
 | **Redis** | 快取 / 佇列 | 便利貼（快速暫存常用資料） |
 | **ClickHouse** | 分析型資料庫 | 大量日誌的高速搜尋引擎 |
 | **MinIO** | 物件儲存 | 自建的 Google Drive（存檔案） |
+
+---
+
+### 11. 實作踩雷紀錄（v3 遷移與 Docker 陷阱）
+
+把整套堆疊真的跑起來時會撞到的問題，這裡先講。每一條都是本 PoC commit history 裡的真實修復項：
+
+#### A. Langfuse v2 → v3 SDK 三種 API 並存陷阱
+
+`langfuse>=2.50.0` 這個 pin 範圍會解析出 v4，但 v3、v4 都有 breaking change。三段程式碼用三種寫法，混在一起時保證至少有一邊壞：
+
+```python
+# v2 (deprecated)
+lf.trace(name="x").span(name="y").end(output=...)
+from langfuse.callback import CallbackHandler
+
+# v3+
+with lf.start_as_current_span(name="y") as s: s.update(output=...)
+from langfuse.langchain import CallbackHandler
+```
+
+**修復**：pin `langfuse>=3,<4`，全面改寫 v2 風格的呼叫。
+
+#### B. NVIDIA NeMo Guardrails 沒有公開 Docker 映像
+
+`nvcr.io/nvidia/nemo-guardrails:latest` 並不存在於 NGC——`docker compose pull` 直接失敗。
+**修復**：用 `configs/nemo-guardrails/Dockerfile` 自己從 pip 包 build。注意要裝 `nemoguardrails[server]` extra（FastAPI/uvicorn 不在預設 deps），且 `annoy` 套件需要 `build-essential` + `python3-dev` 才能編譯。
+
+#### C. slim Python 映像沒有 wget／curl
+
+`python:3.11-slim` 系列（LiteLLM、MLflow、NeMo Guardrails、Dagster 都基於它）連 wget 都沒有。Compose 上常見的：
+```yaml
+healthcheck:
+  test: ["CMD", "wget", "--spider", "http://localhost:4000/health"]
+```
+都會直接 `wget: not found`。**修復**：改用 bash 內建 `/dev/tcp/`：
+```yaml
+test: ["CMD-SHELL", "bash -c '</dev/tcp/localhost/4000' >/dev/null 2>&1 || exit 1"]
+```
+
+#### D. Next.js standalone 不綁 loopback
+
+Langfuse v3 是 Next.js 16 standalone，預設只綁容器 eth0 IP（log 顯示 `http://<容器ID>:3000`），**不**綁 `127.0.0.1` / `localhost`。容器內部 `wget http://localhost:3000` → connection refused。
+**修復**：healthcheck 用 `$HOSTNAME`（容器 ID，會經 `/etc/hosts` 解析到 eth0 IP）：
+```yaml
+test: ["CMD-SHELL", "wget --spider http://$$HOSTNAME:3000/api/public/health || exit 1"]
+```
+
+#### E. MLflow 官方映像沒有 psycopg2
+
+`ghcr.io/mlflow/mlflow:latest` 不附 `psycopg2-binary`，但 `--backend-store-uri postgresql://...` 又一定要它。
+**修復**：自建映像加 `pip install psycopg2-binary`（見 `configs/mlflow/Dockerfile`）。
+
+#### F. Dagster webserver/daemon 啟動時是「空殼」
+
+官方 `dagster/dagster-webserver` 映像只有 dagster 本身，沒有你的 `@asset` 程式碼，也沒有 `dagster.yaml`（→ 預設用 ephemeral SQLite，重啟全丟）。
+**修復**：
+
+- 自建映像安裝 `dagster-postgres` + 你的 ML 依賴（pandas/sklearn/mlflow）
+- mount `./mlops:/opt/dagster/app`
+- 提供 `configs/dagster/dagster.yaml`（Postgres 儲存）
+- `command:` 顯式指定 `--workspace`
+
+#### G. Open WebUI 沒給 OPENAI_API_KEY 會 401
+
+Open WebUI 透過 OpenAI-compatible client 呼叫 LiteLLM，但 LiteLLM 啟用了 `master_key`。
+**修復**：在 compose `environment:` 加 `OPENAI_API_KEY: ${LITELLM_MASTER_KEY}`。
+
+#### H. env_file 不會展開 ${VAR}
+
+Docker Compose 對 `env_file:` 載入的檔案 **不做變數替換**——`.env` 裡寫 `GUARDRAILS_LLM_API_KEY=${LITELLM_MASTER_KEY}` 會原樣以字串 `"${LITELLM_MASTER_KEY}"` 注入容器。
+**修復**：把這種「引用他變數」的條目搬到 compose YAML 的 `environment:` 區塊，那裡才有 substitution。
+
+#### I. MinIO 預設要 Bearer Token
+
+`/minio/v2/metrics/cluster` 預設要授權；Prometheus 不會自動帶 token，scrape 直接 401。
+**修復**：在 minio 服務環境加 `MINIO_PROMETHEUS_AUTH_TYPE: public`。
+
+#### J. Qdrant client.query(query_text=…) 需要 fastembed extra
+
+舊版示範常用 `client.query(query_text=...)`——這是 fastembed 路徑，需要 `pip install qdrant-client[fastembed]`，且 collection 是用 `client.add()` 建立。一般 collection 應該用 `client.query_points(query=<vector>, ...)` 並讀 `point.payload`（不是 `point.metadata`）。
+
+> 上面這些不是 framework 的「bug」，都是「README/官方文件沒講清楚」的營運摩擦。本專案的價值之一，就是把這些坑都填好之後留下可重現的設定。
 
 ---
 
@@ -462,6 +759,54 @@ python scripts/test_integration.py
 | Dagster | http://localhost:3070 | 管線排程 |
 | Grafana | http://localhost:3001 | 監控 Dashboard |
 | Qdrant | http://localhost:6333/dashboard | 向量 DB 管理 |
+
+---
+
+## 介面截圖
+
+實際跑起來的樣子，幫助你在動手前先有概念：
+
+### Prometheus — 抓取目標清單
+
+確認 LiteLLM / MinIO / Qdrant 三個指標來源都是 `UP`，每 15 秒更新一次。
+
+![Prometheus targets](docs/screenshots/prometheus-targets.png)
+
+### Qdrant — 向量資料庫 Dashboard
+
+Qdrant 內建的 Web UI，可以瀏覽 collection、檢視向量點與 payload。
+
+![Qdrant dashboard](docs/screenshots/qdrant-dashboard.png)
+
+### MLflow — 實驗追蹤
+
+每次 `mlflow.start_run()` 都會記錄參數、指標與模型成品；左側可比較多次實驗。
+
+![MLflow experiments](docs/screenshots/mlflow-experiments.png)
+
+### Dagster — Asset Graph
+
+`mlops/dagster_pipeline.py` 註冊的三個 Software-Defined Asset，可以從 UI 直接觸發 materialize。
+
+![Dagster overview](docs/screenshots/dagster-overview.png)
+
+### Grafana — 登入頁
+
+預設帳密由 `.env` 的 `GF_SECURITY_ADMIN_USER` / `GF_SECURITY_ADMIN_PASSWORD` 控制（範本為 `admin` / `changeme-grafana-password`）；登入後可看到 provisioning 帶入的 LLMOps 監控面板。
+
+![Grafana login](docs/screenshots/grafana-login.png)
+
+### Langfuse — 註冊頁
+
+首次造訪需註冊本地帳號（自建模式，資料不離開本地）。
+
+![Langfuse sign-up](docs/screenshots/langfuse-signup.png)
+
+### Open WebUI — 註冊頁
+
+首位註冊者會自動成為 admin；之後在 Settings → Models 選 LiteLLM 提供的模型即可開始對話。
+
+![Open WebUI sign-up](docs/screenshots/openwebui-signup.png)
 
 ---
 

@@ -3,14 +3,14 @@ model_list:
     litellm_params:
       model: "openai/gemma-4-26b-a4b-it-4bit"
       api_base: "os.environ/LOCAL_LLM_BASE_URL"
-      api_key: "no-key-needed"
+      api_key: "os.environ/OMLX_API_KEY"
 
   # Embedding endpoint served by the same OMLX server.
   - model_name: "text-embedding"
     litellm_params:
       model: "openai/text-embedding"
       api_base: "os.environ/LOCAL_LLM_BASE_URL"
-      api_key: "no-key-needed"
+      api_key: "os.environ/OMLX_API_KEY"
 
   - model_name: "gpt-4o"
     litellm_params:
