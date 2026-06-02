@@ -814,6 +814,16 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 >
 > 同樣的問題會發生在 pipx——`pipx install` 的 venv 也不是 activated venv。
 >
+> #### OMLX `model` 欄位**必須**用完整 HF id（`org/repo`）
+>
+> mlx_lm 內部以 `snapshot_download(model_id, local_files_only=True)` 解析 model_id，cache 路徑慣例是 `~/.cache/huggingface/hub/models--<org>--<repo>/`。如果你傳給 OMLX 的 model id 漏了 `mlx-community/` 前綴，會去找 `models--gemma-4-26b-a4b-it-4bit/` 那個**不存在**的資料夾，直接 raise `LocalEntryNotFoundError`，回 500。
+>
+> 影響：
+> - `configs/litellm/config.yaml` 的 `model:` 必須寫 `openai/mlx-community/gemma-4-26b-a4b-it-4bit`（chat 與 embedding 一致）。
+> - 應用端如果直接打 OMLX，`{"model": "..."}` 也要帶完整 id。
+>
+> 而且：OMLX 有 in-process `wrapper_cache`。**如果你曾用錯的 short id call 過，那個失敗結果會被 cache 住**；後來改用正確的 full id 仍可能受影響。修法：`pkill -f mlx-omni-server` 重啟，cache 自動清空。
+>
 > #### OMLX chat 端點突然全部 500（embedding 卻 200）的兩個常見原因
 >
 > 實測踩過：embedding `/v1/embeddings` 一直 200 OK，但 chat `/v1/chat/completions` 對任何模型都回 500，響應時間 < 100ms（連模型推論都沒進到）。

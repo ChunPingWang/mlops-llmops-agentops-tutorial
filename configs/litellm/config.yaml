@@ -1,7 +1,9 @@
 model_list:
   - model_name: "gemma-4-26b"
     litellm_params:
-      model: "openai/gemma-4-26b-a4b-it-4bit"
+      # OMLX / mlx_lm 的 hf_repo_to_path 寫死 local_files_only=True，
+      # 必須用完整 HF id 才能命中 ~/.cache/huggingface/hub/models--<org>--<repo>/ 路徑
+      model: "openai/mlx-community/gemma-4-26b-a4b-it-4bit"
       api_base: "os.environ/LOCAL_LLM_BASE_URL"
       api_key: "os.environ/OMLX_API_KEY"
 
