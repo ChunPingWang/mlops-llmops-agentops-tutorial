@@ -7,7 +7,10 @@ models:
     engine: openai
     model: gemma-4-26b
     parameters:
-      api_base: ${GUARDRAILS_LLM_BASE_URL}
+      # NeMo Guardrails 0.10+ uses base_url (OpenAI Python SDK v1+ convention).
+      # `api_base` from older NeMo is deprecated/ignored; pointing at LiteLLM
+      # without this overrides becomes https://api.openai.com/v1 → 401.
+      base_url: ${GUARDRAILS_LLM_BASE_URL}
       api_key: ${GUARDRAILS_LLM_API_KEY}
 
 rails:

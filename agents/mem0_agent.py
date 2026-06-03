@@ -132,9 +132,10 @@ def main() -> None:
             name="mem0-search", input={"query": conv2_query}
         ) as span_search:
             try:
+                # mem0 0.1.x moved user_id out of search() kwargs into filters
                 search_results = m.search(
                     query=conv2_query,
-                    user_id=user_id,
+                    filters={"user_id": user_id},
                 )
                 span_search.update(output=search_results)
                 pretty_print("mem0.search() result", search_results)
@@ -164,7 +165,8 @@ def main() -> None:
         # --------------------------------------------------------------
         with langfuse.start_as_current_span(name="mem0-get-all") as span_getall:
             try:
-                all_memories = m.get_all(user_id=user_id)
+                # mem0 0.1.x: filters={'user_id': ...} (same API change as search)
+                all_memories = m.get_all(filters={"user_id": user_id})
                 span_getall.update(output=all_memories)
                 pretty_print("mem0.get_all() -- all memories for alice", all_memories)
             except Exception as exc:
@@ -197,7 +199,7 @@ def main() -> None:
                     print(f"Error deleting memory: {exc}")
                     raise
 
-            remaining = m.get_all(user_id=user_id)
+            remaining = m.get_all(filters={"user_id": user_id})
             pretty_print("Remaining memories after deletion", remaining)
         else:
             print("No memories to delete.")

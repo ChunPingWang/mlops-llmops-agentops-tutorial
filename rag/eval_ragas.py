@@ -190,12 +190,15 @@ def get_eval_llm() -> ChatOpenAI:
 
 
 def get_eval_embeddings() -> OpenAIEmbeddings:
-    """Embedding model used by Ragas (via local LLM endpoint)."""
+    """Embedding model used by Ragas. Calls OMLX directly (not via LiteLLM proxy)
+    so model id must be the full HF repo path; LITELLM short alias 'text-embedding'
+    won't be recognised by OMLX."""
     base_url = _get_env("LOCAL_LLM_BASE_URL")
+    api_key = os.getenv("OMLX_API_KEY", "no-key-needed")
     return OpenAIEmbeddings(
-        model="text-embedding",
+        model=os.getenv("EMBEDDING_MODEL", "mlx-community/mxbai-embed-large-v1"),
         base_url=base_url,
-        api_key="no-key-needed",
+        api_key=api_key,
         check_embedding_ctx_length=False,
     )
 

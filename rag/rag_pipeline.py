@@ -71,15 +71,19 @@ def get_langfuse_handler() -> LangfuseCallbackHandler | None:
 # ---------------------------------------------------------------------------
 
 def get_embeddings(
-    model: str = "text-embedding",
+    model: str | None = None,
     base_url: str | None = None,
 ) -> OpenAIEmbeddings:
-    """Return an OpenAI-compatible embedding model pointing at the local LLM endpoint."""
+    """Return an OpenAI-compatible embedding model pointing at OMLX directly.
+
+    Model id must be the full HF repo path (OMLX doesn't know short aliases).
+    """
     base_url = base_url or _get_env("LOCAL_LLM_BASE_URL")
+    model = model or os.getenv("EMBEDDING_MODEL", "mlx-community/mxbai-embed-large-v1")
     return OpenAIEmbeddings(
         model=model,
         base_url=base_url,
-        api_key="no-key-needed",  # local endpoint; key not required
+        api_key=os.getenv("OMLX_API_KEY", "no-key-needed"),
         check_embedding_ctx_length=False,
     )
 

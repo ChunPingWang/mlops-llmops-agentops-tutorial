@@ -1,9 +1,11 @@
 model_list:
+  # 邏輯 alias 保留 "gemma-4-26b" 不改，避免 agent/test 腳本全部要改。
+  # 實際上游是 Mistral-Nemo——Gemma 4 是多模態（Gemma4ForConditional-
+  # Generation）會被 OMLX 走 mlx_vlm loader，但 4-bit 量化版缺
+  # preprocessor_config.json 而 crash；改用純文字模型避開這個 VLM 路徑。
   - model_name: "gemma-4-26b"
     litellm_params:
-      # OMLX / mlx_lm 的 hf_repo_to_path 寫死 local_files_only=True，
-      # 必須用完整 HF id 才能命中 ~/.cache/huggingface/hub/models--<org>--<repo>/ 路徑
-      model: "openai/mlx-community/gemma-4-26b-a4b-it-4bit"
+      model: "openai/mlx-community/Mistral-Nemo-Instruct-2407-4bit"
       api_base: "os.environ/LOCAL_LLM_BASE_URL"
       api_key: "os.environ/OMLX_API_KEY"
 

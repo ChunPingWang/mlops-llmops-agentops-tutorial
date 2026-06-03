@@ -52,11 +52,17 @@ GUARDRAILS_URL = os.getenv("GUARDRAILS_URL", "http://localhost:8090")
 
 
 def _embed_query(text: str) -> list[float]:
-    """Call the local LLM's OpenAI-compatible /embeddings endpoint."""
+    """Call OMLX's /embeddings directly. Must use full HF id; bearer if set."""
     base_url = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:8000/v1").rstrip("/")
+    model = os.getenv("EMBEDDING_MODEL", "mlx-community/mxbai-embed-large-v1")
+    headers = {}
+    api_key = os.getenv("OMLX_API_KEY") or os.getenv("LOCAL_LLM_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     resp = httpx.post(
         f"{base_url}/embeddings",
-        json={"model": "text-embedding", "input": [text]},
+        json={"model": model, "input": [text]},
+        headers=headers,
         timeout=60.0,
     )
     resp.raise_for_status()
@@ -128,9 +134,14 @@ def guardrails_check(text: str) -> str:
         text: The LLM-generated text to validate.
     """
     try:
+        # NeMo Guardrails 0.10+ schema: config_id sits inside a nested
+        # `guardrails` object (GuardrailsDataInput), NOT top-level.
+        # Our compose mounts configs/guardrails to /app/config so the
+        # registered config_id is "config" (per /v1/rails/configs).
         response = httpx.post(
             f"{GUARDRAILS_URL}/v1/chat/completions",
             json={
+                "guardrails": {"config_id": "config-rendered"},
                 "model": MODEL_NAME,
                 "messages": [
                     {
@@ -226,7 +237,12 @@ def output_node(state: RAGState) -> dict:
     guardrails_result = state.get("guardrails_result", "")
     answer = state.get("generated_answer", "")
 
-    if "failed" in guardrails_result.lower() or "error" in guardrails_result.lower():
+    # Treat only an explicit "check failed" prefix as failure; the guardrails
+    # response *content* may itself contain words like "error" even when the
+    # safety check passed (e.g. when Guardrails' internal LLM fall-back
+    # answers with a message that happens to mention errors).
+    if guardrails_result.lower().startswith("guardrails check failed") \
+            or guardrails_result.lower().startswith("guardrails check error"):
         final = (
             "The generated answer did not pass guardrails validation.\n"
             f"Guardrails feedback: {guardrails_result}\n"
