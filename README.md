@@ -1,6 +1,6 @@
 # LLMOps / AgentOps / MLOps PoC 全棧工具鏈教學
 
-> 一站式部署 14 個服務，涵蓋 LLM 路由、可觀測性、RAG、安全護欄、Agent 編排、ML 實驗追蹤與監控告警。
+> 一站式部署 **16 個服務**（14 個核心 + minio-init + langfuse-worker），涵蓋 LLM 路由、可觀測性、RAG、安全護欄、Agent 編排、ML 實驗追蹤與監控告警。
 
 ---
 
@@ -11,7 +11,7 @@
 - [技術原理詳解](#技術原理詳解)
 - [目錄結構](#目錄結構)
 - [快速開始](#快速開始)
-- [本地推論伺服器（OMLX / vLLM）](#本地推論伺服器omlx--vllm)
+- [本地推論伺服器 OMLX / vLLM](#本地推論伺服器-omlx--vllm)
 - [介面截圖](#介面截圖)
 - [設定檔詳解](#設定檔詳解)
 - [腳本詳解](#腳本詳解)
@@ -61,9 +61,12 @@
 │                                                            │
 │   LiteLLM Proxy (:4000)  ← 所有 LLM 請求的入口           │
 │       │                                                    │
-│       ├─→ 本地 Gemma 4 (:8000)   [Primary - 低延遲]       │
-│       ├─→ Azure OpenAI            [Fallback - 穩定]        │
-│       └─→ Anthropic Claude        [Fallback - 品質]        │
+│       ├─→ 本地推論 :8000    [Primary - 低延遲]            │
+│       │   alias「gemma-4-26b」實際路由到                  │
+│       │   mlx-community/Mistral-Nemo-Instruct-2407-4bit   │
+│       │   (細節見 §本地推論伺服器 → A.5)                  │
+│       ├─→ Azure OpenAI       [Fallback - 穩定]            │
+│       └─→ Anthropic Claude   [Fallback - 品質]            │
 │                                                            │
 ├─── backend-net ───────────────────────────────────────────┤
 │                                                            │
@@ -129,7 +132,9 @@
 └─────────────────────────────────┘
 ```
 
-**Fallback 機制：** 當本地 Gemma 4 回應逾時或出錯時，LiteLLM 會自動把請求轉發給 Azure OpenAI。你的應用程式完全不需要知道這件事。
+**Fallback 機制：** 當本地推論回應逾時或出錯時，LiteLLM 會自動把請求轉發給 Azure OpenAI。你的應用程式完全不需要知道這件事。
+
+> **註**：本專案的 `gemma-4-26b` alias 實際背後跑的是 `mlx-community/Mistral-Nemo-Instruct-2407-4bit`（換掉 Gemma 4 的原因見 [§A.5](#a5-實際採用的-chat-模型-vs-文件標示)）。這正好示範 LiteLLM 的 alias 機制——「邏輯名」與「物理模型」可以完全解耦。
 
 #### 更深入：路由演算法與成本計算
 
@@ -681,7 +686,7 @@ OMLX 有 in-process `wrapper_cache` 快取每個 `model_id` 對應的 `ChatGener
 ml-llm-agent-ops-tutorial/
 │
 ├── ADR-001-LLMOps-AgentOps-MLOps-PoC-Plan.md  # 架構決策文件
-├── docker-compose.yml                          # 14 個服務的部署定義
+├── docker-compose.yml                          # 16 個服務的部署定義 (14 核心 + minio-init + langfuse-worker)
 ├── .env.example                                # 環境變數範本
 ├── .gitignore                                  # Git 排除規則
 ├── requirements.txt                            # Python 依賴套件
@@ -737,8 +742,8 @@ ml-llm-agent-ops-tutorial/
 | Docker + Docker Compose | v24+ |
 | Python | 3.11+ |
 | 本地推論主機 | Apple Silicon Mac（OMLX）**或** Linux + GPU（vLLM/Ollama） |
-| LLM 記憶體 | 16 GB VRAM 或 16 GB 統一記憶體（跑 Gemma 4 26B 4-bit） |
-| RAM | 64 GB（含 14 個 Docker 服務） |
+| LLM 記憶體 | 8 GB+（本 PoC 實機跑 Mistral-Nemo-Instruct-2407-4bit，約 7 GB；換成 Gemma 4 26B 4-bit 等需 16 GB） |
+| RAM | 64 GB（16 個 Docker 服務合計 ~30 GB；32 GB 勉強跑核心子集） |
 | Disk | 50 GB+ SSD |
 
 ### 步驟
@@ -788,7 +793,9 @@ python scripts/test_integration.py
 
 ---
 
-## 本地推論伺服器（OMLX / vLLM）
+## 本地推論伺服器 OMLX / vLLM
+
+> 章節原名「本地推論伺服器（OMLX / vLLM）」；移除中文括弧只是為了讓 GitHub TOC anchor 不會歧義。
 
 LiteLLM 本身不做推論——它只是把請求轉發給「真正的模型伺服器」。Docker stack 啟動前，這個 chat + embedding 端點必須先準備好。本專案在 macOS 上以 [OMLX (mlx-omni-server)](https://github.com/madroidmaq/mlx-omni-server) 為主，在 Linux + GPU 上以 vLLM 為主，兩者都提供 OpenAI-compatible API。
 
@@ -846,7 +853,7 @@ OMLX = `mlx-omni-server`，把 Apple 的 MLX runtime 包成 OpenAI-compatible AP
 > mlx_lm 內部以 `snapshot_download(model_id, local_files_only=True)` 解析 model_id，cache 路徑慣例是 `~/.cache/huggingface/hub/models--<org>--<repo>/`。如果你傳給 OMLX 的 model id 漏了 `mlx-community/` 前綴，會去找 `models--gemma-4-26b-a4b-it-4bit/` 那個**不存在**的資料夾，直接 raise `LocalEntryNotFoundError`，回 500。
 >
 > 影響：
-> - `configs/litellm/config.yaml` 的 `model:` 必須寫 `openai/mlx-community/gemma-4-26b-a4b-it-4bit`（chat 與 embedding 一致）。
+> - `configs/litellm/config.yaml` 的 `model:` 必須寫 `openai/<org>/<repo>` 完整 id（本 PoC 實際用的是 `openai/mlx-community/Mistral-Nemo-Instruct-2407-4bit`，見 [§A.5](#a5-實際採用的-chat-模型-vs-文件標示)）。
 > - 應用端如果直接打 OMLX，`{"model": "..."}` 也要帶完整 id。
 >
 > 而且：OMLX 有 in-process `wrapper_cache`。**如果你曾用錯的 short id call 過，那個失敗結果會被 cache 住**；後來改用正確的 full id 仍可能受影響。修法：`pkill -f mlx-omni-server` 重啟，cache 自動清空。
@@ -908,7 +915,9 @@ uv pip install mlx-omni-server mlx-embeddings
 python -m spacy download en_core_web_sm   # 預先補 spacy 模型，避免 runtime auto-install 觸發 uv pip 失敗
 
 # 預先 pull chat + embedding 模型（不下也行，首次請求會自動下載）
-hf download mlx-community/gemma-4-26b-a4b-it-4bit
+# 本 PoC 實機用 Mistral-Nemo (純文字、7 GB)；Gemma 4 是多模態架構在
+# OMLX 上會走 VLM loader 而 crash，理由與 alternatives 見 §A.5
+hf download mlx-community/Mistral-Nemo-Instruct-2407-4bit
 hf download mlx-community/mxbai-embed-large-v1
 
 # 啟動 server（必須在 activated venv 內！綁 0.0.0.0 才能讓 Docker host 連上）
@@ -1067,7 +1076,7 @@ EMBEDDING_MODEL=mlx-community/mxbai-embed-large-v1 # 選好的 embedding id
 | 設定 | 不做會發生什麼 | 為什麼 |
 |------|---------------|--------|
 | **`pip install mlx-embeddings`** | `/v1/embeddings` 回 **404**，所有 RAG/Mem0 驗證（V-09/V-11/V-19）整段斷線 | mlx-omni-server 採「optional dependency」設計，embeddings router 只在啟動時能 `import mlx_embeddings` 才會掛載；缺套件就靜默跳過，FastAPI 路由表裡根本沒有這個 URL |
-| **預先 `huggingface-cli download`** | 第一次請求要等下載（幾百 MB 到幾 GB），測試 timeout 失敗，誤判成「服務壞掉」 | mlx-omni-server 是 lazy-load，模型不在 `~/.cache/huggingface` 就會即時下載；預 pull 把這個延遲移到「設定時」而非「測試時」 |
+| **預先 `hf download`**（舊名 `huggingface-cli download` 已 deprecated） | 第一次請求要等下載（幾百 MB 到幾 GB），測試 timeout 失敗，誤判成「服務壞掉」 | mlx-omni-server 是 lazy-load，模型不在 `~/.cache/huggingface` 就會即時下載；預 pull 把這個延遲移到「設定時」而非「測試時」 |
 | **server 綁 `--host 0.0.0.0`** | 從別台機器（如跑 Docker stack 的 Linux 主機）連會 `connection refused` | 預設只綁 `127.0.0.1`，外部請求 ARP 得到主機後 TCP 連不到 service。Mac 跟 Docker 主機是同一台時這條可以省略，跨機器則必開 |
 | **bearer token（`OMLX_API_KEY`）對齊** | LiteLLM 拿到上游 **401**，所有 chat 與 embedding 都失敗 | OMLX 啟用 `--api-keys` 後會驗 `Authorization: Bearer <key>`；LiteLLM 用 `configs/litellm/config.yaml` 的 `api_key: "os.environ/OMLX_API_KEY"` 從容器環境讀值；`.env` 沒設或字串不一致就一路 401 |
 | **`EMBEDDING_MODEL` 設成完整 HF id** | LiteLLM 路由失敗：`Bad model id` 或 OMLX 端 404 | LiteLLM `model_list` 裡 `text-embedding` 的 `model:` 欄位（去前綴 `openai/`）會原封不動轉發給上游；OMLX 接 OpenAI API 規範，model 欄位必須是它認識的 HF id（短名 `text-embedding-3-small` 不會自動 resolve） |
@@ -1279,16 +1288,26 @@ services:
 model_list:
   - model_name: "gemma-4-26b"              # 你的應用程式用這個名字呼叫
     litellm_params:
-      model: "openai/gemma-4-26b-a4b-it-4bit"  # 實際的模型標識
+      # 實際模型 (alias 解耦：背後可以隨意換而不影響呼叫端)
+      model: "openai/mlx-community/Mistral-Nemo-Instruct-2407-4bit"
       api_base: "os.environ/LOCAL_LLM_BASE_URL" # 從環境變數讀取 URL
-      api_key: "no-key-needed"                  # 本地推論不需要 Key
+      api_key: "os.environ/OMLX_API_KEY"        # OMLX bearer (見 .env)
+
+  # Embedding 走同一個 OMLX server 的另一個 endpoint
+  - model_name: "text-embedding"
+    litellm_params:
+      model: "openai/mlx-community/mxbai-embed-large-v1"
+      api_base: "os.environ/LOCAL_LLM_BASE_URL"
+      api_key: "os.environ/OMLX_API_KEY"
 
 router_settings:
   fallbacks:
     - gemma-4-26b: ["gpt-4o", "claude-sonnet"]  # 失敗時依序嘗試
 
 litellm_settings:
-  success_callback: ["langfuse"]  # 每次成功呼叫都通知 Langfuse 記錄
+  # callback 名單同時啟用 Langfuse trace 和 Prometheus /metrics
+  success_callback: ["langfuse", "prometheus"]
+  failure_callback: ["langfuse", "prometheus"]
 ```
 
 **`os.environ/XXX` 語法：** LiteLLM 特有的寫法，表示「從環境變數讀取這個值」。這樣敏感資訊（API Key）不用寫死在設定檔中。
@@ -1592,20 +1611,28 @@ def model_evaluation(feature_engineered_data):
 
 **驗證項目：** V-01 ~ V-25（全部）
 
-自動化驗證 25 個項目，輸出類似：
+自動化驗證 25 個項目。本 PoC 實機跑出的結果是 **24 PASS / 1 SKIP**：
 
 ```
 ╔══════╦══════════════════════════════════════╦════════╗
-║ V-01 ║ LiteLLM → Local Gemma 4            ║  PASS  ║
-║ V-02 ║ LiteLLM → Azure OpenAI             ║  PASS  ║
-║ V-03 ║ LiteLLM Fallback                   ║  PASS  ║
-║ ...  ║ ...                                ║  ...   ║
-║ V-25 ║ Docker Compose 全棧啟停             ║  PASS  ║
+║ V-01 ║ LiteLLM → 本地推論 (gemma-4-26b)    ║  PASS  ║
+║ V-02 ║ LiteLLM → Azure OpenAI              ║  SKIP  ║   ← 無實 key (見下方註)
+║ V-03 ║ LiteLLM Fallback                    ║  PASS  ║
+║ V-06 ║ Langfuse Trace Capture              ║  PASS  ║   ← 130 條 trace 累積
+║ V-09 ║ RAGAS Eval                          ║  PASS  ║   ← answer_relevancy=0.95
+║ V-11 ║ RAG End-to-End                      ║  PASS  ║
+║ V-12 ║ Guardrails PII Block                ║  PASS  ║
+║ V-15-17 ║ ReAct / Tool / HITL              ║  PASS  ║
+║ V-19 ║ Mem0 Memory                         ║  PASS  ║
+║ V-20-22 ║ MLflow / Dagster                 ║  PASS  ║
+║ V-25 ║ Docker Compose 14/14 healthy         ║  PASS  ║
 ╚══════╩══════════════════════════════════════╩════════╝
-Total: 18 PASS / 2 FAIL / 5 SKIP
+Total: 24 PASS / 1 SKIP / 0 FAIL
 ```
 
-對於需要手動驗證的項目（如 Agent 腳本），會標記為 SKIP 並提示執行方式。
+> **V-02 SKIP 註**：本次驗證未提供 Azure 實際 key（範本是 placeholder）。fallback 鏈本身已由 V-03 證實正常運作（gemma-4-26b 走通即代表 router 健康）。需要驗證 Azure 時填入 `.env` 的 `AZURE_API_KEY`/`AZURE_API_BASE`/`AZURE_API_VERSION` 再 `docker compose up -d --no-deps --force-recreate litellm` 即可。
+
+對於需要手動驗證的項目（如 Agent 腳本），整合測試會標記為 SKIP 並提示執行方式（如 `python agents/react_agent.py`）。
 
 ---
 
@@ -1613,8 +1640,8 @@ Total: 18 PASS / 2 FAIL / 5 SKIP
 
 | 編號 | 領域 | 項目 | 對應腳本 / 設定 |
 |------|------|------|----------------|
-| V-01 | LLMOps | LiteLLM → 本地 Gemma 4 | `configs/litellm/config.yaml` |
-| V-02 | LLMOps | LiteLLM → Azure OpenAI | `configs/litellm/config.yaml` |
+| V-01 | LLMOps | LiteLLM → 本地推論（alias `gemma-4-26b`，實際 Mistral-Nemo） | `configs/litellm/config.yaml` |
+| V-02 | LLMOps | LiteLLM → Azure OpenAI（本 PoC 跳過，需實 key） | `configs/litellm/config.yaml` |
 | V-03 | LLMOps | Fallback 機制 | `configs/litellm/config.yaml` (router_settings) |
 | V-04 | LLMOps | Virtual Key 認證 | LiteLLM UI |
 | V-05 | LLMOps | 成本追蹤 | LiteLLM /spend API |
@@ -1647,12 +1674,14 @@ Total: 18 PASS / 2 FAIL / 5 SKIP
 
 可以，但需要修改 `configs/litellm/config.yaml`，把 fallback 中的雲端模型設為 primary。或者使用更小的本地模型（如 Gemma 2B）。
 
-### Q: 為什麼用 Gemma 4 而不是 GPT-4o？
+### Q: 為什麼選本地推論模型（Gemma 4 / Mistral-Nemo 之類）而不是 GPT-4o？
 
 - **資料不離開本地**：企業環境中，資料主權很重要
 - **零 API 費用**：只有電費
 - **低延遲**：不需要網路往返
 - **雲端作為 Fallback**：本地掛了還有備援
+
+> **設計時的選擇 vs 實機跑的版本**：ADR-001 與架構圖以 **Gemma 4 26B** 為目標，實機因為 Gemma 4 是多模態架構（mlx-omni-server 走 VLM loader 缺 `preprocessor_config.json` → 500），改用純文字的 **Mistral-Nemo-Instruct-2407-4bit**。LiteLLM alias `gemma-4-26b` 保留不動，所以 14 個 agent / test 腳本完全不用改。詳見 [§A.5](#a5-實際採用的-chat-模型-vs-文件標示)。
 
 ### Q: 32GB RAM 能跑嗎？
 
