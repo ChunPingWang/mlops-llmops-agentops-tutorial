@@ -69,7 +69,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(litellm_requests_total[24h]))",
+          "expr": "sum(increase(litellm_requests_metric_total[24h]))",
           "legendFormat": "Total Requests",
           "refId": "A"
         }
@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "avg(litellm_request_duration_seconds)",
+          "expr": "sum(rate(litellm_request_total_latency_metric_sum[5m])) / sum(rate(litellm_request_total_latency_metric_count[5m]))",
           "legendFormat": "Avg Latency",
           "refId": "A"
         }
@@ -173,7 +173,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(litellm_requests_total{status=\"error\"}[5m])) / sum(rate(litellm_requests_total[5m])) * 100",
+          "expr": "sum(rate(litellm_deployment_failure_responses_total[5m])) / sum(rate(litellm_requests_metric_total[5m])) * 100",
           "legendFormat": "Error Rate",
           "refId": "A"
         }
@@ -222,7 +222,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(litellm_tokens_total[24h]))",
+          "expr": "sum(increase(litellm_total_tokens_metric_total[24h]))",
           "legendFormat": "Total Tokens",
           "refId": "A"
         }
@@ -311,7 +311,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by(model)(rate(litellm_requests_total[5m]))",
+          "expr": "sum by(model)(rate(litellm_requests_metric_total[5m]))",
           "legendFormat": "{{model}}",
           "refId": "A"
         }
@@ -393,7 +393,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.95, rate(litellm_request_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.95, rate(litellm_request_total_latency_metric_bucket[5m]))",
           "legendFormat": "p95",
           "refId": "A"
         },
@@ -402,7 +402,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "histogram_quantile(0.50, rate(litellm_request_duration_seconds_bucket[5m]))",
+          "expr": "histogram_quantile(0.50, rate(litellm_request_total_latency_metric_bucket[5m]))",
           "legendFormat": "p50",
           "refId": "B"
         }
@@ -490,7 +490,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(litellm_fallback_total[1h]))",
+          "expr": "sum(increase(litellm_deployment_failed_fallbacks_total[1h]))",
           "legendFormat": "Fallbacks",
           "refId": "A"
         }
@@ -571,7 +571,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "litellm_active_connections",
+          "expr": "litellm_in_flight_requests",
           "legendFormat": "Active Connections",
           "refId": "A"
         }

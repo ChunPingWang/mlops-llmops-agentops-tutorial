@@ -144,6 +144,12 @@ services:
     image: grafana/grafana:latest
     ports:
       - "0.0.0.0:3001:3000"
+    environment:
+      # Allow read-only browsing without login so dashboards are linkable
+      # (admin login still works for editing). PoC convenience; turn off in prod.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_ANONYMOUS_HIDE_VERSION: "true"
     env_file: .env
     volumes:
       - grafana_data:/var/lib/grafana

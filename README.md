@@ -11,6 +11,8 @@
 - [技術原理詳解](#技術原理詳解)
 - [目錄結構](#目錄結構)
 - [快速開始](#快速開始)
+- [本地推論伺服器（OMLX / vLLM）](#本地推論伺服器omlx--vllm)
+- [介面截圖](#介面截圖)
 - [設定檔詳解](#設定檔詳解)
 - [腳本詳解](#腳本詳解)
 - [驗證項目清單](#驗證項目清單)
@@ -644,6 +646,31 @@ Docker Compose 對 `env_file:` 載入的檔案 **不做變數替換**——`.env
 
 舊版示範常用 `client.query(query_text=...)`——這是 fastembed 路徑，需要 `pip install qdrant-client[fastembed]`，且 collection 是用 `client.add()` 建立。一般 collection 應該用 `client.query_points(query=<vector>, ...)` 並讀 `point.payload`（不是 `point.metadata`）。
 
+#### K. Gemma 4 在 OMLX 上載不起來（VLM loader 缺 preprocessor_config.json）
+
+`mlx-community/gemma-4-26b-a4b-it-4bit` 是 `Gemma4ForConditionalGeneration` 多模態架構，OMLX 自動走 `mlx_vlm.utils.load`，但 4-bit 量化版**沒附** `preprocessor_config.json`，啟動時 raise `OSError: Can't load feature extractor`。**修復**：改用純文字模型（本專案改用 `mlx-community/Mistral-Nemo-Instruct-2407-4bit`），LiteLLM alias 保留 `gemma-4-26b` 不動。詳見 § [本地推論伺服器 → A.5](#a5-實際採用的-chat-模型-vs-文件標示)。
+
+#### L. NeMo Guardrails YAML 不展開 `${VAR}` + `api_base` 已改名
+
+兩個獨立但同時發生的坑：
+
+1. NeMo Guardrails 直接解析 YAML，**不會**展開 `${GUARDRAILS_LLM_BASE_URL}` 之類的 placeholder——它把字串原樣傳給 OpenAI client → 拿到 `Incorrect API key provided: ${GUARDR*****KEY}`。
+2. 0.10+ 把 `parameters.api_base` 改名為 `parameters.base_url`（跟齊 OpenAI SDK v1+ 命名）；沒指定 `base_url` 時預設打 `https://api.openai.com/v1` → 401。
+
+**修復**：自建 nemo-guardrails 映像加 `gettext-base`，entrypoint 用 `envsubst` 先把 `${...}` 展開到 `/app/config-rendered` 再啟動 server；同時把 config.yml 的 `api_base` 改成 `base_url`。
+
+#### M. NeMo Guardrails `config_id` 在 nested `guardrails` 物件，不在 body 頂層
+
+`/v1/chat/completions` schema 的 `config_id` 包在 `GuardrailsDataInput` 子物件（`{"guardrails": {"config_id": "..."}}`）裡，**不是** `{"config_id": "..."}` 頂層。傳錯位置回 422 "No guardrails config_id provided"。
+
+#### N. mlx_lm 寫死 `local_files_only=True`，model id **必須完整 HF path**
+
+`mlx_lm/utils.py:hf_repo_to_path` 寫死 `snapshot_download(model_id, local_files_only=True)`，**永遠不會**自動上網下載。對應的 HF cache 路徑慣例是 `~/.cache/huggingface/hub/models--<org>--<repo>/`。傳 short name `gemma-4-26b-a4b-it-4bit`（缺 `mlx-community/`）會找 `models--gemma-4-26b-a4b-it-4bit` 那個不存在的資料夾，立刻 `LocalEntryNotFoundError` → 500。**修復**：LiteLLM `model:` 必須用完整 `openai/<org>/<repo>` 格式（chat 與 embedding 都一樣）。
+
+#### O. OMLX `wrapper_cache` 會記住失敗結果，需要重啟才會清
+
+OMLX 有 in-process `wrapper_cache` 快取每個 `model_id` 對應的 `ChatGenerator`。**失敗的載入也會被快取**——後續同樣 model_id 的請求即使環境修好還是會拿到舊的失敗。**修復**：`pkill -f mlx-omni-server` 重啟，cache 即清空。
+
 > 上面這些不是 framework 的「bug」，都是「README/官方文件沒講清楚」的營運摩擦。本專案的價值之一，就是把這些坑都填好之後留下可重現的設定。
 
 ---
@@ -941,6 +968,66 @@ uv pip install -U mlx-omni-server mlx-embeddings
 
 > ⚠️ **注意**：`mlx-embeddings` 套件本身**沒有** `.server` 模組（它是 library，不是 server）；網路上有些教學提到 `python -m mlx_embeddings.server` **是錯的**，會出 `No module named mlx_embeddings.server`。要拆 embedding server 唯一可靠的辦法是另一個 mlx-omni-server process 跑在不同 port（兩個 venv / 不同 HF cache 也行），用 LiteLLM `model_list` 兩條 `api_base` 接過去。但**多數情況不需要拆**——一個 mlx-omni-server 同時服務 chat + embedding 完全可行（A.1 已驗證）。
 
+#### A.5 ⚠️ 實際採用的 chat 模型 vs 文件標示
+
+| 層級 | 字串 | 角色 |
+|------|------|------|
+| 全文 README / ADR-001 / 架構圖 | **`gemma-4-26b-a4b-it-4bit`**（Gemma 4 26B） | 設計時的目標模型 |
+| `.env` 的 `LOCAL_LLM_MODEL=` | `gemma-4-26b-a4b-it-4bit` | 文件對齊 |
+| LiteLLM `model_list.model_name`（**邏輯 alias**） | `gemma-4-26b` | 應用程式呼叫用 |
+| LiteLLM `model_list.model`（**實際上游**） | **`openai/mlx-community/Mistral-Nemo-Instruct-2407-4bit`** | OMLX 真正載入的 model |
+| 14 個 agent / test 腳本 | `model="gemma-4-26b"`（alias） | 跟著 LiteLLM 解析到 Mistral |
+
+**也就是說，alias 名「gemma-4-26b」現在背後跑的是 Mistral-Nemo。**
+
+##### 為什麼換掉 Gemma 4？
+
+驗證時實測踩到的真實 stack trace（也是本 PoC 修復過的真實 bug）：
+
+```
+OSError: Can't load feature extractor for
+'/Users/.../models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/.../'.
+... is the correct path to a directory containing a preprocessor_config.json file
+```
+
+根本原因：
+
+| 環節 | 細節 |
+|------|------|
+| Gemma 4 架構名 | `Gemma4ForConditionalGeneration`（HF config.json 寫死） |
+| 配套 config 欄位 | `audio_token_id`, `boi_token_id`, `boa_token_id`（image / audio 多模態 token marker） |
+| mlx-omni-server 載入路徑 | 看到多模態架構 → 走 `mlx_vlm.utils.load`（VLM loader，非純文字 loader） |
+| `mlx_vlm` 要求 | `preprocessor_config.json`（影像預處理設定） |
+| 4-bit 量化版實況 | **沒附** `preprocessor_config.json` → 載入 raise `OSError` → API 回 500 |
+
+兩條解法當時並排比較：
+
+| 解法 | 改動 | 風險 |
+|------|------|------|
+| **A. 換純文字模型** ← 採用 | 改一行 LiteLLM config 的 `model:` | 失去 Gemma 多模態能力（但 PoC 用不到） |
+| B. 補 `preprocessor_config.json` | 從 Google 原始 Gemma 4 repo 抓那個檔放進 4-bit snapshot dir | 需 Google Gemma license + 不保證跟 4-bit 量化的 vision tower 相容 |
+
+`Mistral-Nemo-Instruct-2407-4bit` 是 **7 GB**（Gemma 4 26B 是 16 GB），純文字，推論明顯更快，品質類似——成本/速度權衡更好。
+
+##### 為什麼 alias 保留 `gemma-4-26b` 不改？
+
+兩個理由：
+
+1. **不動到應用層**：14 個 agent / test 腳本都寫死 `model="gemma-4-26b"`；改 alias = 14 處要動。alias 制度就是用來吸收這種變化的——換上游不影響呼叫端。
+2. **展示 LiteLLM 的核心價值**：LiteLLM 的存在意義就是 [邏輯名 → 實際路由] 解耦。保留這個「名實不符」剛好示範：應用程式呼叫的「邏輯模型」可以**完全獨立**於背後的「物理模型」。換 vLLM、換 OpenAI、換本地 OMLX，都只動 `config.yaml` 的一行 `model:`。
+
+##### 如果你想真的用 Gemma 4
+
+選一個**純文字**的 Gemma 系列就行（不要 `Gemma4ForConditionalGeneration`）：
+
+| HF id | 註記 |
+|------|------|
+| `mlx-community/gemma-2-27b-it-4bit` | Gemma 2 27B，純文字，同規模 |
+| `mlx-community/gemma-2-9b-it-4bit` | 較小 / 較快 |
+| `mlx-community/gemma-3-27b-it-4bit` | Gemma 3 27B，純文字 |
+
+下載後把 `configs/litellm/config.yaml` 的 `model:` 改成 `openai/<新 id>`，重啟 LiteLLM 即可。**alias `gemma-4-26b` 仍可保留不動**。
+
 ### B. Linux + GPU — vLLM 路線
 
 ```bash
@@ -1123,9 +1210,20 @@ Qdrant 內建的 Web UI，可以瀏覽 collection、檢視向量點與 payload�
 
 ![Dagster overview](docs/screenshots/dagster-overview.png)
 
-### Grafana — 登入頁
+### Grafana — LLMOps 監控面板
 
-預設帳密由 `.env` 的 `GF_SECURITY_ADMIN_USER` / `GF_SECURITY_ADMIN_PASSWORD` 控制（範本為 `admin` / `changeme-grafana-password`）；登入後可看到 provisioning 帶入的 LLMOps 監控面板。
+跑過幾個請求後的 LLMOps Overview dashboard（已預設啟用 anonymous viewer，本機可不登入直接看）：
+
+- **Total Requests / Average Latency / Total Tokens / Error Rate** ── 即時 KPI（24h / 5m 滑動窗）
+- **Request Rate by Provider** ── 按 model 分群（chat: `Mistral-Nemo`、embedding: `mxbai-embed-large-v1`）
+- **Latency Distribution** ── p50 / p95 (`histogram_quantile`)
+- **Fallback Triggers / Active Connections** ── 健康指標
+
+「No data」格不一定是壞事——例如 *Error Rate* 是 No data 代表沒任何 LLM 呼叫失敗，*Fallback Triggers* 是 No data 代表 primary（OMLX）一直正常、router 沒走到 Azure/Anthropic。
+
+![Grafana LLMOps dashboard](docs/screenshots/grafana-llmops-dashboard.png)
+
+> 預設帳密由 `.env` 的 `GF_SECURITY_ADMIN_USER` / `GF_SECURITY_ADMIN_PASSWORD` 控制（範本為 `admin` / `changeme-grafana-password`），需要修改 dashboard 才用得到。
 
 ![Grafana login](docs/screenshots/grafana-login.png)
 
