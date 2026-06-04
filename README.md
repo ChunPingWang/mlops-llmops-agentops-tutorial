@@ -651,9 +651,20 @@ Docker Compose 對 `env_file:` 載入的檔案 **不做變數替換**——`.env
 
 舊版示範常用 `client.query(query_text=...)`——這是 fastembed 路徑，需要 `pip install qdrant-client[fastembed]`，且 collection 是用 `client.add()` 建立。一般 collection 應該用 `client.query_points(query=<vector>, ...)` 並讀 `point.payload`（不是 `point.metadata`）。
 
-#### K. Gemma 4 在 OMLX 上載不起來（VLM loader 缺 preprocessor_config.json）
+#### K. Gemma 4 在 OMLX 上載不起來（schema 換代，mlx_vlm 沒跟上）
 
-`mlx-community/gemma-4-26b-a4b-it-4bit` 是 `Gemma4ForConditionalGeneration` 多模態架構，OMLX 自動走 `mlx_vlm.utils.load`，但 4-bit 量化版**沒附** `preprocessor_config.json`，啟動時 raise `OSError: Can't load feature extractor`。**修復**：改用純文字模型（本專案改用 `mlx-community/Mistral-Nemo-Instruct-2407-4bit`），LiteLLM alias 保留 `gemma-4-26b` 不動。詳見 § [本地推論伺服器 → A.5](#a5-實際採用的-chat-模型-vs-文件標示)。
+精確說法不是「mlx-community 漏打包」——是 **Google 在 Gemma 4 把 metadata schema 改了**（舊：`preprocessor_config.json`；新：`processor_config.json` 合併檔），但 **mlx_vlm 還在用舊 schema 找檔**。所有 Gemma 4 26B 變體（含 Google 官方 `google/gemma-4-26B-A4B-it`）都只有新檔沒有舊檔——換 repo 救不了。
+
+對應症狀：OMLX `/v1/chat/completions` 對 Gemma 4 任何變體都回 500，stack trace 終止於 `OSError: Can't load feature extractor for .../snapshots/... is the correct path to a directory containing a preprocessor_config.json file`。
+
+**四條修法**（本 PoC 採 A，想保留 Gemma 4 vision 看 B）：
+
+- **A. 換純文字模型**（本專案：`mlx-community/Mistral-Nemo-Instruct-2407-4bit`），LiteLLM alias `gemma-4-26b` 保留不動
+- **B. 手動補 `preprocessor_config.json`**：從同 repo 的 `processor_config.json` 抽 image_processor 區塊存成獨立檔，放進 HF cache snapshot dir（只能救文字+影像，音訊仍壞）
+- **C. 換成純文字 Gemma**：`mlx-community/gemma-3-27b-it-4bit` / `gemma-2-27b-it-4bit` 等 `…ForCausalLM` 架構不走 VLM 路徑
+- **D. 追蹤 upstream 修復**：[Blaizzy/mlx-vlm#903](https://github.com/Blaizzy/mlx-vlm/issues/903)、[#905](https://github.com/Blaizzy/mlx-vlm/issues/905)、[huggingface/transformers#45372](https://github.com/huggingface/transformers/issues/45372)
+
+完整變體對照表 + 解法 B 的 JSON 內容與指令見 § [本地推論伺服器 → A.5](#a5-實際採用的-chat-模型-vs-文件標示)。
 
 #### L. NeMo Guardrails YAML 不展開 `${VAR}` + `api_base` 已改名
 
@@ -999,24 +1010,95 @@ OSError: Can't load feature extractor for
 ... is the correct path to a directory containing a preprocessor_config.json file
 ```
 
-根本原因：
+##### 根本原因不是「mlx-community 漏打包」，而是 Google 改 metadata schema、mlx_vlm 還沒跟上
 
-| 環節 | 細節 |
-|------|------|
-| Gemma 4 架構名 | `Gemma4ForConditionalGeneration`（HF config.json 寫死） |
-| 配套 config 欄位 | `audio_token_id`, `boi_token_id`, `boa_token_id`（image / audio 多模態 token marker） |
-| mlx-omni-server 載入路徑 | 看到多模態架構 → 走 `mlx_vlm.utils.load`（VLM loader，非純文字 loader） |
-| `mlx_vlm` 要求 | `preprocessor_config.json`（影像預處理設定） |
-| 4-bit 量化版實況 | **沒附** `preprocessor_config.json` → 載入 raise `OSError` → API 回 500 |
+進一步研究後修正最初的判斷：這**不是某個 repo 沒打包好**——而是 **Google 在 Gemma 4 把 metadata schema 整個換掉了**，但 mlx_vlm 還在用舊 schema 找檔。
 
-兩條解法當時並排比較：
+| 時期 | 影像 / 音訊 metadata 寫哪 |
+|------|--------------------------|
+| 舊 schema（< Gemma 4 / transformers < 5.5） | 各自獨立檔：`preprocessor_config.json`、`audio_feature_extractor_config.json` |
+| **新 schema（Gemma 4 / transformers 5.5+）** | **單一檔 `processor_config.json`** 包含 image_processor + audio_feature_extractor + tokenizer |
+| mlx_vlm 0.x | 還在用 `AutoProcessor.from_pretrained()` 找舊 schema 的 `preprocessor_config.json` |
 
-| 解法 | 改動 | 風險 |
-|------|------|------|
-| **A. 換純文字模型** ← 採用 | 改一行 LiteLLM config 的 `model:` | 失去 Gemma 多模態能力（但 PoC 用不到） |
-| B. 補 `preprocessor_config.json` | 從 Google 原始 Gemma 4 repo 抓那個檔放進 4-bit snapshot dir | 需 Google Gemma license + 不保證跟 4-bit 量化的 vision tower 相容 |
+實測比對 **8 個 Gemma 4 26B 變體**（含 Google 官方、mlx-community、lmstudio-community、nvidia）：
+
+| Repo | 量化 | 大小 | `preprocessor_config.json` | `processor_config.json` | gated |
+|------|------|------|---------------------------|------------------------|-------|
+| `mlx-community/gemma-4-26b-a4b-it-4bit` | MLX 4-bit | 15.6 GB | ❌ | ✅ 627 B | 否 |
+| `mlx-community/gemma-4-26b-a4b-it-8bit` | MLX 8-bit | 28 GB | ❌ | ✅ | 否 |
+| `mlx-community/gemma-4-26b-a4b-it-bf16` | bf16 | 52 GB | ❌ | ✅ | 否 |
+| `mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit` | OptiQ 4-bit | 15 GB | ❌ | ✅ | 否 |
+| `lmstudio-community/gemma-4-26B-A4B-it-MLX-4bit` | MLX 4-bit | 15.6 GB | ❌ | ✅ 902 B | 否 |
+| `mlx-community/gemma-4-e4b-it-4bit`（小型） | MLX 4-bit | 5.2 GB | ❌ | ✅ | 否 |
+| **`google/gemma-4-26B-A4B-it`（官方上游）** | bf16 | 51.6 GB | ❌ | ✅ 1.69 kB | 是（Gemma license） |
+| `nvidia/Gemma-4-26B-A4B-NVFP4` | NVFP4 | — | — | — | （非 MLX） |
+
+**沒有任何 Gemma 4 repo 附 `preprocessor_config.json`**——包括 Google 官方。換到別的 4-bit 變體救不了。
+
+對照組：**非 Gemma 4 的 VLM 在 mlx_vlm 下能跑**，因為它們還用舊 schema：
+- ✅ `mlx-community/Qwen2-VL-7B-Instruct-4bit`（附 `preprocessor_config.json` 499 B）
+- ✅ `mlx-community/llava-1.5-7b-4bit`（兩個檔都有）
+
+##### 四條解法並排比較
+
+| 解法 | 改動 | 多模態能力 | 推薦度 |
+|------|------|-----------|--------|
+| **A. 換純文字模型** ← 本 PoC 採用 | LiteLLM `model:` 一行字 | 失去多模態（PoC 用不到） | ★★★★★ 對本 PoC 最省事 |
+| **B. 手動補 `preprocessor_config.json`**（見下方指令） | 在 HF cache 寫入一個 JSON | 文字+影像 OK，**音訊仍壞** | ★★★★ 想保留 Gemma 4 vision 時用 |
+| C. 換成純文字 Gemma | 下載 `mlx-community/gemma-3-27b-it-4bit` 之類 | 失去多模態，但留 Gemma 系列 | ★★★ |
+| D. 等 mlx_vlm 修 | 追蹤 [Blaizzy/mlx-vlm#903](https://github.com/Blaizzy/mlx-vlm/issues/903)、[#905](https://github.com/Blaizzy/mlx-vlm/issues/905) | 修好後完整 | ★★ 純等不可控 |
 
 `Mistral-Nemo-Instruct-2407-4bit` 是 **7 GB**（Gemma 4 26B 是 16 GB），純文字，推論明顯更快，品質類似——成本/速度權衡更好。
+
+##### 解法 B 具體指令（保留 Gemma 4 vision）
+
+從同 repo 的 `processor_config.json` 抽出 `image_processor` 區塊存成獨立檔放進 HF cache snapshot dir：
+
+```bash
+# 1. 找到 snapshot 路徑（commit hash 因下載時點略有不同，用 ls 確認）
+SNAP=~/.cache/huggingface/hub/models--mlx-community--gemma-4-26b-a4b-it-4bit/snapshots/efbeee6e582ebfd06abc9d65e90839c4b5d2116b
+
+# 2. 寫入舊 schema 的 preprocessor_config.json
+cat > "$SNAP/preprocessor_config.json" << 'EOF'
+{
+  "do_convert_rgb": true,
+  "do_normalize": false,
+  "do_rescale": true,
+  "do_resize": true,
+  "image_mean": [0.0, 0.0, 0.0],
+  "image_processor_type": "Gemma4ImageProcessor",
+  "image_seq_length": 280,
+  "image_std": [1.0, 1.0, 1.0],
+  "max_soft_tokens": 280,
+  "patch_size": 16,
+  "pooling_kernel_size": 3,
+  "resample": 3,
+  "rescale_factor": 0.00392156862745098,
+  "size": {"height": 224, "width": 224},
+  "processor_class": "Gemma4Processor"
+}
+EOF
+
+# 3. 砍掉 OMLX wrapper_cache（記得 in-process cache 會保留失敗紀錄）
+pkill -f mlx-omni-server
+source ~/.venvs/omlx/bin/activate
+mlx-omni-server --host 0.0.0.0 --port 8000
+
+# 4. 把 LiteLLM 切回 Gemma 4（替代 Mistral 那行）
+#    configs/litellm/config.yaml:
+#      model: "openai/mlx-community/gemma-4-26b-a4b-it-4bit"
+# 然後 docker compose up -d --no-deps --force-recreate litellm
+```
+
+> **警告**：上面這個 JSON 抽自 `processor_config.json` 的 image_processor 區塊；**audio 不會跑**（mlx_vlm 對應的音訊路徑也沒實作完，見 [Blaizzy/mlx-vlm#903](https://github.com/Blaizzy/mlx-vlm/issues/903)）。只想拿文字+影像 ok。
+
+##### Upstream 追蹤（修了就不用 workaround）
+
+正確的 fix 是 mlx_vlm 改為「找不到 `preprocessor_config.json` 時 fallback 用 `processor_config.json`」。可追蹤：
+
+- [Blaizzy/mlx-vlm#903](https://github.com/Blaizzy/mlx-vlm/issues/903) — Gemma 4 E2B/E4B audio gibberish（同根源）
+- [Blaizzy/mlx-vlm#905](https://github.com/Blaizzy/mlx-vlm/issues/905) — Gemma4 E2B vision encoder
+- [huggingface/transformers#45372](https://github.com/huggingface/transformers/issues/45372) — Gemma 4 processor loading regression in transformers 5.5+
 
 ##### 為什麼 alias 保留 `gemma-4-26b` 不改？
 
